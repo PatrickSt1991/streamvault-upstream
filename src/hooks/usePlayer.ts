@@ -9,7 +9,7 @@ import { saveWatchProgress, getWatchProgress, getSubtitlesEnabled, setSubtitlesE
 import { clientLogger as log } from '../utils/logger';
 import { useAppStore } from '../stores/appStore';
 import { browserTranscodePath, iphoneVodPlaybackPath, toAbsolutePlayerUrl } from '../utils/stream-url';
-import { isIPhone } from '../utils/platform';
+import { isAppleMobile } from '../utils/platform';
 import { getHtml5WatchProgress, getResumePosition } from '../utils/media-progress';
 import { LiveStreamRecovery } from '../utils/live-stream-recovery';
 import { hasDecodedFrameProgress, withLiveStreamOptions } from '../utils/live-stream-options';
@@ -439,7 +439,7 @@ export function usePlayer(): {
         video.onloadedmetadata = () => log.info(`HTML5 event: loadedmetadata, duration=${video.duration}, videoWidth=${video.videoWidth}x${video.videoHeight}`);
         video.onloadeddata = () => {
           log.info(`HTML5 event: loadeddata, readyState=${video.readyState}`);
-          if (resumePosition > 0 && !needsBrowserTranscode && !iphoneVodPath) {
+          if (resumePosition > 0 && !needsBrowserTranscode && !appleMobileVodPath) {
             video.currentTime = resumePosition;
           }
           startBgProgressTracking();
@@ -522,14 +522,14 @@ export function usePlayer(): {
       const isRecording = channel.id.startsWith('recording_');
       // Recordings have a direct server URL; live/VOD go through stream proxy
       const apiBaseUrl = useChannelStore.getState().apiBaseUrl;
-      const iphoneVodPath = isIPhone()
+      const appleMobileVodPath = isAppleMobile()
         ? iphoneVodPlaybackPath(channel.id, channel.url, channel.contentType, resumePosition)
         : null;
-      const needsBrowserTranscode = !isLiveTs && !isRecording && !iphoneVodPath;
+      const needsBrowserTranscode = !isLiveTs && !isRecording && !appleMobileVodPath;
       const playUrl = isRecording
         ? `${apiBaseUrl}${channel.url}`
-        : iphoneVodPath
-          ? `${apiBaseUrl}${iphoneVodPath}`
+        : appleMobileVodPath
+          ? `${apiBaseUrl}${appleMobileVodPath}`
             : needsBrowserTranscode
             ? `${apiBaseUrl}${browserTranscodePath(channel.id, channel.id.startsWith('episode_') ? channel.url : undefined, resumePosition)}`
             : getStreamUrl(channel.id, channel.url, false, isLiveTs, audioOnly);
@@ -613,7 +613,7 @@ export function usePlayer(): {
         // before playback starts. iOS Safari may clamp this without user
         // gesture, but Chrome/Edge/Android honor it.
         try { video.preload = 'auto'; } catch { /* ignore */ }
-        video.dataset.streamOffset = needsBrowserTranscode || iphoneVodPath ? String(resumePosition) : '0';
+        video.dataset.streamOffset = needsBrowserTranscode || appleMobileVodPath ? String(resumePosition) : '0';
         video.src = playUrl;
         video.load();
       }
@@ -697,14 +697,14 @@ export function usePlayer(): {
       const video = document.getElementById('av-player') as HTMLVideoElement | null;
       const channel = usePlayerStore.getState().currentChannel;
       if (!video || !channel) return;
-      const iphoneVodPath = isIPhone()
+      const appleMobileVodPath = isAppleMobile()
         ? iphoneVodPlaybackPath(channel.id, channel.url, channel.contentType, time)
         : null;
-      const usesTranscode = channel.contentType !== 'livetv' && !channel.id.startsWith('recording_') && !iphoneVodPath;
-      if (iphoneVodPath) {
+      const usesTranscode = channel.contentType !== 'livetv' && !channel.id.startsWith('recording_') && !appleMobileVodPath;
+      if (appleMobileVodPath) {
         const apiBaseUrl = useChannelStore.getState().apiBaseUrl;
         video.dataset.streamOffset = String(time);
-        video.src = `${apiBaseUrl}${iphoneVodPath}`;
+        video.src = `${apiBaseUrl}${appleMobileVodPath}`;
         video.load();
         video.play().catch(() => {});
       } else if (usesTranscode) {

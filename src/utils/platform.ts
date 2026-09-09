@@ -23,6 +23,20 @@ export function isIPhone(): boolean {
   return /iPhone|iPod/i.test(navigator.userAgent);
 }
 
+/**
+ * Detect Apple mobile WebKit for media delivery decisions. iPadOS can expose a
+ * Macintosh user agent in desktop mode, so its touch-capable MacIntel platform
+ * is part of the check while ordinary Macs remain excluded.
+ */
+export function isAppleMobile(
+  userAgent = navigator.userAgent,
+  platform = navigator.platform,
+  maxTouchPoints = navigator.maxTouchPoints,
+): boolean {
+  return /iPhone|iPad|iPod/i.test(userAgent)
+    || (platform === 'MacIntel' && maxTouchPoints > 1);
+}
+
 export function isTizen(): boolean {
   return typeof webapis !== 'undefined' && typeof webapis.avplay !== 'undefined';
 }
