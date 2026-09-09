@@ -31,6 +31,14 @@ export class FixedWindowRateLimiter {
   }
 }
 
+/**
+ * Allow normal native-HLS seek bursts without returning JSON to the media
+ * element, while preserving a bounded per-client authorization rate.
+ */
+export function createIosHlsAuthorizationLimiter(): FixedWindowRateLimiter {
+  return new FixedWindowRateLimiter(30, 60_000);
+}
+
 export interface IosHlsTicketClaims {
   channelId: string;
   sourceUrl: string;

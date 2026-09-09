@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { FixedWindowRateLimiter, createIosHlsTicket, sanitizeFfmpegMessage, verifyIosHlsTicket } from './ios-hls-security';
+import { FixedWindowRateLimiter, createIosHlsAuthorizationLimiter, createIosHlsTicket, sanitizeFfmpegMessage, verifyIosHlsTicket } from './ios-hls-security';
 
 const claims = {
   channelId: 'vod_83608',
@@ -26,6 +26,14 @@ describe('iOS HLS signed tickets', () => {
     expect(limiter.allow('client', 1)).toBe(true);
     expect(limiter.allow('client', 2)).toBe(false);
     expect(limiter.allow('client', 1_001)).toBe(true);
+  });
+
+  it('allows the observed iPad seek burst while retaining a per-minute ceiling', () => {
+    const limiter = createIosHlsAuthorizationLimiter();
+    for (let request = 0; request < 30; request++) {
+      expect(limiter.allow('ipad', request * 1_000)).toBe(true);
+    }
+    expect(limiter.allow('ipad', 30_000)).toBe(false);
   });
 
   it('rejects malformed JSON ticket bodies without throwing', () => {

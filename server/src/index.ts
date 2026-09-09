@@ -42,7 +42,7 @@ import { buildFragmentedMp4Args } from './vod-remux.js';
 import { buildBrowserCompatibleVideoArgs } from './browser-transcode.js';
 import { buildIosHlsArgs, iosHlsContentType } from './ios-hls.js';
 import { IOS_HLS_IDLE_TIMEOUT_MS, findReusableIosHlsSession, iosHlsProcessExitState, iosHlsSessionKey, iosHlsSessionLimitReason, selectIosHlsSessionsToRetire } from './ios-hls-sessions.js';
-import { FixedWindowRateLimiter, createIosHlsTicket, sanitizeFfmpegMessage, verifyIosHlsTicket } from './ios-hls-security.js';
+import { createIosHlsAuthorizationLimiter, createIosHlsTicket, sanitizeFfmpegMessage, verifyIosHlsTicket } from './ios-hls-security.js';
 import { selectIosVodFallback } from './ios-vod.js';
 import { parseByteRange } from './ranges.js';
 import { allowedProxyHostsFromConfig, maskConfigResponse, normalizeAllowedOrigins, requireAuth, validateExternalHttpUrl } from './security.js';
@@ -66,7 +66,7 @@ const MAX_IOS_HLS_SESSIONS = 2;
 const liveAudioTranscodes = new ConcurrentStreamLimiter(2);
 const iosHlsTicketSecret = randomBytes(32).toString('hex');
 const iosHlsTicketNonces = new Map<string, number>();
-const iosHlsAuthorizationLimiter = new FixedWindowRateLimiter(12, 60_000);
+const iosHlsAuthorizationLimiter = createIosHlsAuthorizationLimiter();
 type IosHlsSession = {
   directory: string;
   process: ReturnType<typeof spawn>;
