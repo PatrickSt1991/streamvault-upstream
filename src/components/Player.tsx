@@ -54,6 +54,7 @@ function LiveChannelRow({ channel, active, programs, onSelect }: {
   return (
     <button
       data-active={active}
+      data-live-channel-row
       className={cn(
         'w-full flex items-center gap-3 px-4 py-3 border-none text-left tap-none active:bg-white/10 transition-colors',
         active ? 'bg-white/[0.08]' : 'bg-transparent'
@@ -64,22 +65,23 @@ function LiveChannelRow({ channel, active, programs, onSelect }: {
         <img
           src={channel.logo}
           alt=""
+          data-live-channel-logo
           className="w-10 h-10 rounded object-contain bg-black/40 shrink-0"
           loading="lazy"
         />
       ) : (
-        <div className="w-10 h-10 rounded bg-white/[0.06] shrink-0 flex items-center justify-center text-[#555] text-xs">TV</div>
+        <div data-live-channel-logo className="w-10 h-10 rounded bg-white/[0.06] shrink-0 flex items-center justify-center text-[#555] text-xs">TV</div>
       )}
       <div className="flex-1 min-w-0 flex flex-col gap-1">
-        <span className={cn(
+        <span data-live-channel-name className={cn(
           'text-sm block truncate',
           active ? 'text-accent font-semibold' : 'text-white'
         )}>{channel.name}</span>
         {current ? (
           <div className="flex flex-col gap-[3px]">
             <div className="flex items-center gap-2">
-              <span className="text-12 text-[#aaa] flex-1 min-w-0 truncate">{current.title}</span>
-              <span className="text-11 text-[#666] tabular-nums shrink-0">
+              <span data-live-epg-title className="text-12 text-[#aaa] flex-1 min-w-0 truncate">{current.title}</span>
+              <span data-live-epg-time className="text-11 text-[#666] tabular-nums shrink-0">
                 {formatHourMinute(new Date(current.start))} – {formatHourMinute(new Date(current.stop))}
               </span>
             </div>

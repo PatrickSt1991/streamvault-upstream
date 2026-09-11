@@ -32,14 +32,34 @@ describe('mobile live player layout', () => {
     expect(declarations(landscapeRule('[data-live-channel-layout]'))).toMatchObject({
       'flex-direction': 'row',
     });
-    expect(declarations(landscapeRule('[data-live-player-panel]'))).toMatchObject({
+    expect(landscapeRule('[data-live-player-panel]')).toBeUndefined();
+    expect(declarations(landscapeRule('[data-live-channel-layout] [data-live-player-panel]'))).toMatchObject({
       width: '66.666667%',
       height: '100%',
       'aspect-ratio': 'auto',
     });
-    expect(declarations(landscapeRule('[data-live-channel-list]'))).toMatchObject({
+    expect(declarations(landscapeRule('[data-live-channel-layout] [data-live-channel-list]'))).toMatchObject({
       width: '33.333333%',
       height: '100%',
+    });
+  });
+
+  it('uses compact channel and EPG text in the narrow landscape list', () => {
+    expect(declarations(landscapeRule('[data-live-channel-layout] [data-live-channel-row]'))).toMatchObject({
+      gap: '8px',
+      padding: '8px 10px',
+    });
+    expect(declarations(landscapeRule('[data-live-channel-layout] [data-live-channel-name]'))).toMatchObject({
+      'font-size': '12px',
+      'line-height': '16px',
+    });
+    expect(declarations(landscapeRule('[data-live-channel-layout] [data-live-epg-title]'))).toMatchObject({
+      'font-size': '11px',
+      'line-height': '14px',
+    });
+    expect(declarations(landscapeRule('[data-live-channel-layout] [data-live-epg-time]'))).toMatchObject({
+      'font-size': '10px',
+      'line-height': '14px',
     });
   });
 

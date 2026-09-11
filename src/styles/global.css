@@ -195,17 +195,42 @@ html[data-tizen] #av-player[data-active] {
     flex-direction: row;
   }
 
-  [data-live-player-panel] {
+  [data-live-channel-layout] [data-live-player-panel] {
     flex: 0 0 66.666667%;
     width: 66.666667%;
     height: 100%;
     aspect-ratio: auto;
   }
 
-  [data-live-channel-list] {
+  [data-live-channel-layout] [data-live-channel-list] {
     flex: 0 0 33.333333%;
     width: 33.333333%;
     height: 100%;
+  }
+
+  [data-live-channel-layout] [data-live-channel-row] {
+    gap: 8px;
+    padding: 8px 10px;
+  }
+
+  [data-live-channel-layout] [data-live-channel-logo] {
+    width: 32px;
+    height: 32px;
+  }
+
+  [data-live-channel-layout] [data-live-channel-name] {
+    font-size: 12px;
+    line-height: 16px;
+  }
+
+  [data-live-channel-layout] [data-live-epg-title] {
+    font-size: 11px;
+    line-height: 14px;
+  }
+
+  [data-live-channel-layout] [data-live-epg-time] {
+    font-size: 10px;
+    line-height: 14px;
   }
 
   #av-player[data-active][data-live-channel-layout] {
