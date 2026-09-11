@@ -43,7 +43,7 @@ function formatHourMinute(d: Date): string {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-function PortraitChannelRow({ channel, active, programs, onSelect }: {
+function LiveChannelRow({ channel, active, programs, onSelect }: {
   channel: Channel;
   active: boolean;
   programs: EpgProgram[] | undefined;
@@ -98,7 +98,7 @@ function PortraitChannelRow({ channel, active, programs, onSelect }: {
   );
 }
 
-function PortraitChannelList({ channels, currentId, onSelect }: {
+function LiveChannelList({ channels, currentId, onSelect }: {
   channels: Channel[];
   currentId: string;
   onSelect: (ch: Channel) => void;
@@ -124,9 +124,13 @@ function PortraitChannelList({ channels, currentId, onSelect }: {
   }, [channels]);
 
   return (
-    <div ref={listRef} className="flex-1 overflow-y-auto bg-[#111] [-webkit-overflow-scrolling:touch]">
+    <div
+      ref={listRef}
+      data-live-channel-list
+      className="flex-1 min-h-0 overflow-y-auto bg-[#111] [-webkit-overflow-scrolling:touch]"
+    >
       {channels.map((ch) => (
-        <PortraitChannelRow
+        <LiveChannelRow
           key={ch.id}
           channel={ch}
           active={ch.id === currentId}
@@ -169,9 +173,9 @@ export default function Player() {
   const hasDuration = isFinite(duration) && duration > 0;
   const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // Portrait mode: show channel list below video for live TV on mobile
-  const canShowPortraitList = MOBILE && isLive && !isFullscreen && groupChannels.length > 0;
-  const showPortraitList = canShowPortraitList && channelListVisible;
+  // Mobile inline mode: list is below the video in portrait and beside it in landscape.
+  const canShowLiveChannelList = MOBILE && isLive && !isFullscreen && groupChannels.length > 0;
+  const showLiveChannelList = canShowLiveChannelList && channelListVisible;
 
   const currentProgram = currentChannel
     ? getCurrentProgram(programs, currentChannel.id)
@@ -621,20 +625,21 @@ export default function Player() {
   return (
     <div
       ref={containerRef}
+      {...(showLiveChannelList ? { 'data-live-channel-layout': '' } : {})}
       className={cn(
         'w-full fixed top-0 left-0 right-0 bottom-0 z-[999]',
-        showPortraitList ? 'h-dvh flex flex-col' : 'h-dvh relative'
+        showLiveChannelList ? 'h-dvh flex flex-col' : 'h-dvh relative'
       )}
       tabIndex={0}
       onKeyDown={handleKeyDown}
       onMouseMove={!MOBILE && !IS_TV ? resetOSDTimer : undefined}
     >
-      {/* Video section — in portrait live mode this is aspect-video, otherwise full.
+      {/* Video section — inline live mode is stacked in portrait and split in landscape.
           On Tizen, AVPlay renders on a hardware plane behind the webview, so this
           area must stay transparent (a bg-black would cover the video). */}
-      <div className={cn(
+      <div data-live-player-panel className={cn(
         'relative',
-        showPortraitList ? 'w-full aspect-video shrink-0' : 'w-full h-full'
+        showLiveChannelList ? 'w-full aspect-video shrink-0' : 'w-full h-full'
       )}>
         {/* Video container — on Tizen, AVPlay needs its own object div.
             On HTML5, the persistent <video> in App.tsx is shown via z-index. */}
@@ -930,7 +935,7 @@ export default function Player() {
           </div>
         )}
         {/* Persistent channel list toggle — always visible outside OSD */}
-        {canShowPortraitList && (
+        {canShowLiveChannelList && (
           <button
             className="absolute bottom-2 right-2 z-[4] flex items-center justify-center w-9 h-9 rounded-full bg-black/60 border border-white/20 text-white tap-none cursor-pointer active:opacity-60"
             onClick={(e) => { e.stopPropagation(); toggleChannelList(); }}
@@ -946,9 +951,9 @@ export default function Player() {
         )}
       </div>
 
-      {/* Channel list below video in portrait live mode */}
-      {showPortraitList && currentChannel && (
-        <PortraitChannelList
+      {/* Channel list below the video in portrait and to its right in landscape */}
+      {showLiveChannelList && currentChannel && (
+        <LiveChannelList
           channels={groupChannels}
           currentId={currentChannel.id}
           onSelect={handleChannelSelect}

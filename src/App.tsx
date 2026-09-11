@@ -33,7 +33,7 @@ const BROWSE_VIEWS = [
 
 const MOBILE_APP = isMobile();
 
-/** Persistent video element — adapts sizing for portrait live mode */
+/** Persistent video element — adapts sizing when the live channel list is open */
 function AvPlayerVideo({ currentView }: { currentView: string }) {
   const currentChannel = usePlayerStore((s) => s.currentChannel);
   const groupChannels = usePlayerStore((s) => s.groupChannels);
@@ -55,7 +55,7 @@ function AvPlayerVideo({ currentView }: { currentView: string }) {
     };
   }, []);
 
-  const isPortraitLive = MOBILE_APP && isLive && !isFullscreen && channelListVisible && groupChannels.length > 0;
+  const showLiveChannelLayout = MOBILE_APP && isLive && !isFullscreen && channelListVisible && groupChannels.length > 0;
 
   return (
     <video
@@ -64,11 +64,12 @@ function AvPlayerVideo({ currentView }: { currentView: string }) {
       preload="auto"
       {...{ 'x-webkit-airplay': 'allow' }}
       {...(currentView === 'player' ? { 'data-active': '' } : {})}
+      {...(showLiveChannelLayout ? { 'data-live-channel-layout': '' } : {})}
       {...(audioOnly ? { 'data-audio-only': '' } : {})}
       className={cn(
         'fixed top-0 left-0 bg-black object-contain object-center',
         currentView === 'player'
-          ? isPortraitLive
+          ? showLiveChannelLayout
             ? 'w-full aspect-video z-[998]'
             : 'w-full h-dvh z-[998]'
           : 'w-px h-px -z-10 opacity-0 pointer-events-none',

@@ -188,6 +188,32 @@ html[data-tizen] #av-player[data-active] {
   height: 1080px;
 }
 
+/* The mobile live-player list stacks in portrait. In landscape it becomes a
+   two-pane layout, with video on the left and the channel list on the right. */
+@media (orientation: landscape) {
+  [data-live-channel-layout] {
+    flex-direction: row;
+  }
+
+  [data-live-player-panel] {
+    flex: 0 0 66.666667%;
+    width: 66.666667%;
+    height: 100%;
+    aspect-ratio: auto;
+  }
+
+  [data-live-channel-list] {
+    flex: 0 0 33.333333%;
+    width: 33.333333%;
+    height: 100%;
+  }
+
+  #av-player[data-active][data-live-channel-layout] {
+    width: 66.666667%;
+    height: 100dvh;
+  }
+}
+
 /* ============================
    Component styles that require
    pseudo-elements or complex selectors
