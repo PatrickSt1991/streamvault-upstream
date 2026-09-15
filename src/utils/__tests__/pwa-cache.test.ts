@@ -9,6 +9,8 @@ describe('CACHEABLE_API_PATTERN', () => {
       '/api/proxy/example',
       '/api/remux/vod_1',
       '/api/transcode/vod_1',
+      '/api/subtitles/episode_1?url=http%3A%2F%2Fprovider.example%2Fepisode.mkv',
+      '/api/subtitles/episode_1/3.vtt?url=http%3A%2F%2Fprovider.example%2Fepisode.mkv',
       '/api/recordings/recording_1',
       '/api/ios-hls/vod_1/index.m3u8',
       '/api/ios-hls-authorize/vod_1/index.m3u8',

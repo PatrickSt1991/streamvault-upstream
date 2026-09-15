@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { browserTranscodePath, iphoneVodPlaybackPath, iosHlsPath, toAbsolutePlayerUrl, vodRemuxPath } from '../stream-url';
+import { browserTranscodePath, iphoneVodPlaybackPath, iosHlsPath, subtitleMetadataPath, subtitleTrackPath, toAbsolutePlayerUrl, vodRemuxPath } from '../stream-url';
 
 describe('toAbsolutePlayerUrl', () => {
   it('turns a same-origin proxy path into an absolute URL for AVPlay', () => {
@@ -48,5 +48,27 @@ describe('toAbsolutePlayerUrl', () => {
 
   it('builds a transcoder URL for a catalogue VOD', () => {
     expect(browserTranscodePath('vod_1467994')).toBe('/api/transcode/vod_1467994');
+  });
+
+  it('preserves fractional start offsets for video and subtitle synchronization', () => {
+    expect(browserTranscodePath('episode_177574', 'http://provider.example/episode.mkv', 120.625)).toContain('start=120.625');
+    expect(iosHlsPath('episode_177574', 'http://provider.example/episode.mkv', 120.625)).toContain('start=120.625');
+  });
+
+  it('uses the same iPhone movie fallback variant for subtitle discovery and extraction', () => {
+    expect(subtitleMetadataPath('vod_83608', undefined, true)).toBe('/api/subtitles/vod_83608?ios=1');
+    expect(subtitleTrackPath('vod_83608', 3, undefined, 120.625, true)).toBe(
+      '/api/subtitles/vod_83608/3.vtt?start=120.625&ios=1'
+    );
+  });
+
+  it('builds subtitle metadata and selected WebVTT URLs for an episode', () => {
+    const directUrl = 'http://provider.example/episode.mkv';
+    expect(subtitleMetadataPath('episode_177574', directUrl)).toBe(
+      '/api/subtitles/episode_177574?url=http%3A%2F%2Fprovider.example%2Fepisode.mkv&type=series'
+    );
+    expect(subtitleTrackPath('episode_177574', 3, directUrl, 120.625)).toBe(
+      '/api/subtitles/episode_177574/3.vtt?url=http%3A%2F%2Fprovider.example%2Fepisode.mkv&type=series&start=120.625'
+    );
   });
 });

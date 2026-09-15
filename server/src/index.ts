@@ -44,6 +44,20 @@ import { buildIosHlsArgs, iosHlsContentType } from './ios-hls.js';
 import { IOS_HLS_IDLE_TIMEOUT_MS, findReusableIosHlsSession, iosHlsProcessExitState, iosHlsSessionKey, iosHlsSessionLimitReason, selectIosHlsSessionsToRetire } from './ios-hls-sessions.js';
 import { createIosHlsAuthorizationLimiter, createIosHlsTicket, sanitizeFfmpegMessage, verifyIosHlsTicket } from './ios-hls-security.js';
 import { selectIosVodFallback } from './ios-vod.js';
+import {
+  SUBTITLE_EXTRACT_TIMEOUT_MS,
+  SUBTITLE_PROBE_TIMEOUT_MS,
+  SUBTITLE_PROCESS_OUTPUT_LIMIT,
+  appendBoundedProcessOutput,
+  buildSubtitleExtractArgs,
+  buildSubtitleProbeArgs,
+  createSubtitleProcessLimiters,
+  createSubtitleRequestLimiter,
+  isSubtitleClientDisconnected,
+  parseSubtitleProbe,
+  parseSubtitleStart,
+  type ProbedSubtitleTrack,
+} from './subtitles.js';
 import { parseByteRange } from './ranges.js';
 import { allowedProxyHostsFromConfig, maskConfigResponse, normalizeAllowedOrigins, requireAuth, validateExternalHttpUrl } from './security.js';
 import { isDatabaseCorruptionError } from './db-lifecycle.js';
@@ -662,6 +676,264 @@ video{width:100%;height:100%;object-fit:contain}
 </body></html>`);
 });
 
+// ---------- Subtitle discovery and browser WebVTT ----------
+
+const SUBTITLE_PROBE_TTL_MS = 6 * 60 * 60_000;
+const SUBTITLE_PROBE_OUTPUT_LIMIT = 2_000_000;
+const subtitleProbeCache = new Map<string, { expiresAt: number; tracks: Promise<ProbedSubtitleTrack[]> }>();
+const subtitleProcessLimiters = createSubtitleProcessLimiters();
+const subtitleRequestLimiter = createSubtitleRequestLimiter();
+
+class SubtitleCapacityError extends Error {}
+
+type SubtitleSource = { cacheKey: string; inputUrl: string };
+
+function subtitleSource(channelId: string, rawUrl: unknown, iosFallback = false): SubtitleSource | null {
+  const requestedChannel = getChannelById(channelId);
+  if (requestedChannel?.url && requestedChannel.content_type !== 'livetv') {
+    const sourceChannel = iosFallback && requestedChannel.content_type === 'movies'
+      ? selectIosVodFallback(
+          requestedChannel,
+          searchChannelsByName(requestedChannel.name.replace(/\s*\[4K\]\s*$/i, ''), 'movies'),
+        )
+      : requestedChannel;
+    return {
+      cacheKey: iosFallback ? `${channelId}:ios:${sourceChannel.id}` : channelId,
+      inputUrl: `http://127.0.0.1:${PORT}/api/stream/${encodeURIComponent(sourceChannel.id)}`,
+    };
+  }
+  if (!channelId.startsWith('episode_') || typeof rawUrl !== 'string') return null;
+  const validation = validateExternalHttpUrl(rawUrl, allowedProxyHostsFromConfig(getConfig('xtream_server'), process.env.STREAMVAULT_PROXY_ALLOWED_HOSTS));
+  if (!validation.ok) return null;
+  const sourcePath = `/api/stream/${encodeURIComponent(channelId)}?url=${encodeURIComponent(validation.url.toString())}&type=series`;
+  return {
+    cacheKey: `${channelId}:${validation.url.toString()}`,
+    inputUrl: `http://127.0.0.1:${PORT}${sourcePath}`,
+  };
+}
+
+function probeSubtitleTracks(source: SubtitleSource): Promise<ProbedSubtitleTrack[]> {
+  const now = Date.now();
+  const cached = subtitleProbeCache.get(source.cacheKey);
+  if (cached && cached.expiresAt > now) return cached.tracks;
+  if (cached) subtitleProbeCache.delete(source.cacheKey);
+
+  const releaseProbeSlot = subtitleProcessLimiters.probes.acquire();
+  if (!releaseProbeSlot) {
+    return Promise.reject(new SubtitleCapacityError('Subtitle discovery capacity reached'));
+  }
+
+  const tracks = new Promise<ProbedSubtitleTrack[]>((resolve, reject) => {
+    const ffprobe = spawn('ffprobe', buildSubtitleProbeArgs(source.inputUrl), { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let processEnded = false;
+    const releaseProcess = () => {
+      if (processEnded) return;
+      processEnded = true;
+      releaseProbeSlot();
+    };
+    const finish = (error?: Error, value: ProbedSubtitleTrack[] = []) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      if (!ffprobe.killed) ffprobe.kill('SIGKILL');
+      finish(new Error('Subtitle discovery timed out'));
+    }, SUBTITLE_PROBE_TIMEOUT_MS);
+    timer.unref();
+
+    ffprobe.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      const responseTooLarge = stdout.length + text.length > SUBTITLE_PROBE_OUTPUT_LIMIT;
+      stdout = appendBoundedProcessOutput(stdout, text, SUBTITLE_PROBE_OUTPUT_LIMIT);
+      if (responseTooLarge) {
+        if (!ffprobe.killed) ffprobe.kill('SIGKILL');
+        finish(new Error('Subtitle metadata response was too large'));
+      }
+    });
+    ffprobe.stderr.on('data', (chunk) => {
+      stderr = appendBoundedProcessOutput(stderr, chunk, SUBTITLE_PROCESS_OUTPUT_LIMIT);
+    });
+    ffprobe.on('error', (error) => {
+      releaseProcess();
+      finish(error);
+    });
+    ffprobe.on('close', (code) => {
+      releaseProcess();
+      if (settled) return;
+      if (code !== 0) {
+        finish(new Error(sanitizeFfmpegMessage(stderr.trim() || `ffprobe exited ${code}`)));
+        return;
+      }
+      finish(undefined, parseSubtitleProbe(stdout));
+    });
+  });
+
+  subtitleProbeCache.set(source.cacheKey, { expiresAt: now + SUBTITLE_PROBE_TTL_MS, tracks });
+  tracks.catch(() => subtitleProbeCache.delete(source.cacheKey));
+  while (subtitleProbeCache.size > 500) {
+    const oldest = subtitleProbeCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    subtitleProbeCache.delete(oldest);
+  }
+  return tracks;
+}
+
+app.get('/api/subtitles/:channelId', async (req, res) => {
+  if (!subtitleRequestLimiter.allow(req.ip || req.socket.remoteAddress || 'unknown')) {
+    res.set('Retry-After', '60').status(429).json({ error: 'Too many subtitle requests' });
+    return;
+  }
+  const source = subtitleSource(req.params.channelId, req.query.url, req.query.ios === '1');
+  if (!source) {
+    res.status(404).json({ error: 'Subtitle source not found' });
+    return;
+  }
+  try {
+    const tracks = await probeSubtitleTracks(source);
+    if (isSubtitleClientDisconnected(req, res)) return;
+    res.set('Cache-Control', 'no-store').json({ tracks });
+  } catch (error) {
+    if (isSubtitleClientDisconnected(req, res)) return;
+    logger.warn(`Subtitle discovery failed for ${req.params.channelId}: ${error instanceof Error ? error.message : error}`);
+    if (error instanceof SubtitleCapacityError) {
+      res.set('Retry-After', '5').status(503).json({ error: 'Subtitle discovery capacity reached' });
+    } else {
+      res.status(502).json({ error: 'Subtitle discovery failed' });
+    }
+  }
+});
+
+app.get('/api/subtitles/:channelId/:streamIndex.vtt', async (req, res) => {
+  if (!subtitleRequestLimiter.allow(req.ip || req.socket.remoteAddress || 'unknown')) {
+    res.set('Retry-After', '60').status(429).json({ error: 'Too many subtitle requests' });
+    return;
+  }
+
+  const streamIndex = parseIntegerQuery(req.params.streamIndex, 0, 999);
+  const startSeconds = parseSubtitleStart(req.query.start);
+  const source = subtitleSource(req.params.channelId, req.query.url, req.query.ios === '1');
+  if (streamIndex === null || streamIndex === undefined || startSeconds === null || !source) {
+    res.status(400).json({ error: 'Invalid subtitle request' });
+    return;
+  }
+
+  let clientClosed = false;
+  let ff: ReturnType<typeof spawn> | null = null;
+  let extractionTimer: ReturnType<typeof setTimeout> | null = null;
+  let responseHandled = false;
+  let releaseExtractionSlot: (() => void) | null = null;
+  let slotReleased = false;
+  const releaseSlot = () => {
+    if (slotReleased) return;
+    slotReleased = true;
+    releaseExtractionSlot?.();
+  };
+  const markResponseHandled = () => {
+    if (responseHandled) return false;
+    responseHandled = true;
+    if (extractionTimer) clearTimeout(extractionTimer);
+    return true;
+  };
+
+  // Register before awaiting the shared probe so a disconnected request can
+  // never continue into a new FFmpeg extraction process.
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    clientClosed = true;
+    markResponseHandled();
+    if (ff && !ff.killed) ff.kill('SIGKILL');
+  });
+
+  try {
+    const tracks = await probeSubtitleTracks(source);
+    if (isSubtitleClientDisconnected(req, res) || clientClosed) return;
+    if (!tracks.some((track) => track.index === streamIndex)) {
+      res.status(404).json({ error: 'Subtitle track not found' });
+      return;
+    }
+  } catch (error) {
+    if (isSubtitleClientDisconnected(req, res) || clientClosed) return;
+    if (error instanceof SubtitleCapacityError) {
+      res.set('Retry-After', '5').status(503).json({ error: 'Subtitle discovery capacity reached' });
+    } else {
+      res.status(502).json({ error: 'Subtitle discovery failed' });
+    }
+    return;
+  }
+
+  if (isSubtitleClientDisconnected(req, res) || clientClosed) return;
+  releaseExtractionSlot = subtitleProcessLimiters.extractions.acquire();
+  if (!releaseExtractionSlot) {
+    res.set('Retry-After', '5').status(503).json({ error: 'Subtitle extraction capacity reached' });
+    return;
+  }
+
+  try {
+    ff = spawn('ffmpeg', buildSubtitleExtractArgs(source.inputUrl, streamIndex, startSeconds || 0), {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    releaseSlot();
+    logger.warn(`Subtitle extraction failed for ${req.params.channelId}: ${error instanceof Error ? error.message : error}`);
+    res.status(500).json({ error: 'Subtitle extraction failed' });
+    return;
+  }
+
+  if (!ff || !ff.stdout || !ff.stderr) {
+    if (ff && !ff.killed) ff.kill('SIGKILL');
+    releaseSlot();
+    res.status(500).json({ error: 'Subtitle extraction failed' });
+    return;
+  }
+  const extractionProcess = ff;
+  const subtitleStdout = ff.stdout;
+  const subtitleStderr = ff.stderr;
+  let stderr = '';
+  res.status(200);
+  res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  setStreamSocketOpts(res);
+
+  extractionTimer = setTimeout(() => {
+    if (!markResponseHandled()) return;
+    logger.warn(`Subtitle extraction timed out for ${req.params.channelId}`);
+    if (ff && !ff.killed) ff.kill('SIGKILL');
+    if (!res.headersSent) res.status(504).json({ error: 'Subtitle extraction timed out' });
+    else res.destroy(new Error('Subtitle extraction timed out'));
+  }, SUBTITLE_EXTRACT_TIMEOUT_MS);
+  extractionTimer.unref();
+
+  subtitleStderr.on('data', (chunk) => {
+    stderr = appendBoundedProcessOutput(stderr, chunk, SUBTITLE_PROCESS_OUTPUT_LIMIT);
+  });
+  subtitleStdout.on('error', () => {});
+  subtitleStdout.pipe(res, { end: false });
+  extractionProcess.on('error', (error) => {
+    releaseSlot();
+    if (!markResponseHandled()) return;
+    logger.warn(`Subtitle extraction failed for ${req.params.channelId}: ${error.message}`);
+    if (!res.headersSent) res.status(500).json({ error: 'Subtitle extraction failed' });
+    else res.destroy(error);
+  });
+  extractionProcess.on('close', (code, signal) => {
+    releaseSlot();
+    if (!markResponseHandled() || clientClosed) return;
+    if (code === 0) res.end();
+    else {
+      logger.warn(`Subtitle extraction exited for ${req.params.channelId}: code=${code} signal=${signal} ${sanitizeFfmpegMessage(stderr.trim())}`);
+      if (!res.headersSent) res.status(502).json({ error: 'Subtitle extraction failed' });
+      else res.destroy(new Error('Subtitle extraction failed'));
+    }
+  });
+});
+
 // ---------- Browser-compatible VOD remux ----------
 // iOS Safari does not play provider MKV files directly. Remuxing the existing
 // HEVC/AAC streams into fragmented MP4 preserves quality and avoids the CPU
@@ -741,7 +1013,7 @@ app.get('/api/transcode/:channelId', (req, res) => {
     return;
   }
 
-  const startSeconds = parseIntegerQuery(req.query.start, 0);
+  const startSeconds = parseSubtitleStart(req.query.start);
   if (startSeconds === null) {
     res.status(400).json({ error: 'Invalid start time' });
     return;
@@ -783,7 +1055,7 @@ app.get('/api/transcode/:channelId', (req, res) => {
 app.get('/api/ios-hls-authorize/:channelId/index.m3u8', (req, res) => {
   const channelId = req.params.channelId;
   const contentType = iosHlsContentType(channelId, req.query.type);
-  const startSeconds = parseIntegerQuery(req.query.start, 0);
+  const startSeconds = parseSubtitleStart(req.query.start);
   if (!contentType || typeof req.query.url !== 'string' || startSeconds === null) {
     res.status(400).json({ error: 'Invalid iPhone HLS request' });
     return;
@@ -851,7 +1123,7 @@ app.get('/api/ios-hls/:channelId/index.m3u8', (req, res) => {
     return;
   }
 
-  const startSeconds = parseIntegerQuery(req.query.start, 0);
+  const startSeconds = parseSubtitleStart(req.query.start);
   if (startSeconds === null) {
     res.status(400).json({ error: 'Invalid start time' });
     return;

@@ -21,6 +21,7 @@ import { cn } from '../utils/cn';
 import { fetchBatchEpg, getCurrentEpg, type EpgProgram, type EpgMap } from '../utils/epg-batch';
 import type { Channel } from '../types';
 import { getAbsoluteSkipTarget } from '../utils/media-progress';
+import { shouldStartPlayerPlayback } from '../utils/player-lifecycle';
 
 const OSD_TIMEOUT = 5000;
 const MOBILE = isMobile();
@@ -145,7 +146,7 @@ function LiveChannelList({ channels, currentId, onSelect }: {
 }
 
 export default function Player() {
-  const { play, stop, retry, togglePlay, seek, getVideoElement, playerState, subtitleTracks, currentSubtitleIndex, subtitleText, cycleSubtitles } = usePlayer();
+  const { play, stop, retry, togglePlay, seek, getVideoElement, playerState, subtitleTracks, currentSubtitleIndex, subtitleText, selectSubtitleTrack } = usePlayer();
   const currentChannel = usePlayerStore((s) => s.currentChannel);
   const groupChannels = usePlayerStore((s) => s.groupChannels);
   const switchToChannel = usePlayerStore((s) => s.switchToChannel);
@@ -170,6 +171,13 @@ export default function Player() {
   const seekBarRef = useRef<HTMLInputElement | null>(null);
   const timeUpdateRef = useRef<number>(0);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const [showSubtitleMenu, setShowSubtitleMenu] = useState(false);
+  const [subtitleMenuCursor, setSubtitleMenuCursor] = useState(0);
+  const subtitleOptions = useMemo(
+    () => [{ index: -1, language: '', label: 'Off' }, ...subtitleTracks],
+    [subtitleTracks],
+  );
+  const currentSubtitleLabel = subtitleTracks.find((track) => track.index === currentSubtitleIndex)?.label;
 
   const isLive = currentChannel?.contentType === 'livetv';
   const hasDuration = isFinite(duration) && duration > 0;
@@ -293,21 +301,21 @@ export default function Player() {
     osdTimerRef.current = setTimeout(() => setShowOSD(false), OSD_TIMEOUT);
   }, []);
 
-  // Start playback when channel changes.
-  // On channel switch: always call play(). On re-mount with same channel: skip if already playing.
+  // Start playback when the channel changes, but preserve the persistent mobile
+  // video and subtitle session when Player is remounted for the same channel.
   const prevChannelRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!channelId) return;
-    if (channelId !== prevChannelRef.current) {
-      // New channel — always start playback
-      prevChannelRef.current = channelId;
+    const previousChannelId = prevChannelRef.current;
+    prevChannelRef.current = channelId;
+    const video = document.getElementById('av-player') as HTMLVideoElement | null;
+    const videoState = video ? {
+      paused: video.paused,
+      readyState: video.readyState,
+      channelId: video.dataset.channelId,
+    } : null;
+    if (shouldStartPlayerPlayback(previousChannelId, channelId, MOBILE, videoState)) {
       play();
-    } else {
-      // Same channel (re-mount) — only play if not already playing
-      const video = document.getElementById('av-player') as HTMLVideoElement | null;
-      if (!video || video.paused || video.readyState === 0) {
-        play();
-      }
     }
     // Mobile: keep playing in the background (PWA/PiP). Desktop & TV: stop
     // when the user leaves the player view.
@@ -569,9 +577,56 @@ export default function Player() {
     }
   }, [showOSD, resetOSDTimer]);
 
+  const openSubtitleMenu = useCallback(() => {
+    if (subtitleTracks.length === 0) {
+      showToast('No subtitles available');
+      return;
+    }
+    const selectedOption = subtitleOptions.findIndex((option) => option.index === currentSubtitleIndex);
+    setSubtitleMenuCursor(selectedOption >= 0 ? selectedOption : 0);
+    setShowSubtitleMenu(true);
+    setShowOSD(true);
+    if (osdTimerRef.current) clearTimeout(osdTimerRef.current);
+  }, [currentSubtitleIndex, showToast, subtitleOptions, subtitleTracks.length]);
+
+  const chooseSubtitle = useCallback((index: number) => {
+    selectSubtitleTrack(index);
+    setShowSubtitleMenu(false);
+    resetOSDTimer();
+  }, [resetOSDTimer, selectSubtitleTrack]);
+
+  const handleSubtitleButton = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (showSubtitleMenu) setShowSubtitleMenu(false);
+    else openSubtitleMenu();
+  }, [openSubtitleMenu, showSubtitleMenu]);
+
   // TV remote keys
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (showSubtitleMenu) {
+        switch (e.keyCode) {
+          case KEY_CODES.UP:
+            e.preventDefault();
+            setSubtitleMenuCursor((cursor) => (cursor - 1 + subtitleOptions.length) % subtitleOptions.length);
+            return;
+          case KEY_CODES.DOWN:
+            e.preventDefault();
+            setSubtitleMenuCursor((cursor) => (cursor + 1) % subtitleOptions.length);
+            return;
+          case KEY_CODES.ENTER:
+            e.preventDefault();
+            chooseSubtitle(subtitleOptions[subtitleMenuCursor]?.index ?? -1);
+            return;
+          case KEY_CODES.GREEN:
+          case KEY_CODES.BACK:
+            e.preventDefault();
+            setShowSubtitleMenu(false);
+            resetOSDTimer();
+            return;
+        }
+      }
+
       resetOSDTimer();
       switch (e.keyCode) {
         case KEY_CODES.ENTER:
@@ -603,11 +658,12 @@ export default function Player() {
           break;
         case KEY_CODES.GREEN:
           e.preventDefault();
-          cycleSubtitles();
+          if (showSubtitleMenu) setShowSubtitleMenu(false);
+          else openSubtitleMenu();
           break;
       }
     },
-    [resetOSDTimer, playerState.status, retry, stop, togglePlay, handleSkip, cycleSubtitles, showToast]
+    [chooseSubtitle, handleSkip, openSubtitleMenu, playerState.status, resetOSDTimer, retry, showSubtitleMenu, showToast, stop, subtitleMenuCursor, subtitleOptions, togglePlay]
   );
 
   const handleChannelSelect = useCallback((ch: Channel) => {
@@ -697,6 +753,40 @@ export default function Player() {
         {currentSubtitleIndex !== -1 && subtitleText && (
           <div className="absolute bottom-[60px] lg:bottom-20 left-1/2 -translate-x-1/2 max-w-[80%] py-2 px-4 bg-black/75 rounded text-20 lg:text-28 text-center z-[2]">
             <span>{subtitleText}</span>
+          </div>
+        )}
+
+        {showSubtitleMenu && (
+          <div
+            data-subtitle-menu
+            role="menu"
+            aria-label="Subtitle language"
+            className="absolute z-[7] top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[min(88vw,420px)] max-h-[70vh] overflow-y-auto rounded-2xl border border-white/15 bg-[#111]/95 p-2 shadow-2xl backdrop-blur"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-3 pt-2 pb-2 text-sm font-semibold text-[#aaa]">Subtitles</div>
+            {subtitleOptions.map((option, optionIndex) => {
+              const selected = option.index === currentSubtitleIndex;
+              const focused = optionIndex === subtitleMenuCursor;
+              return (
+                <button
+                  key={`${option.index}-${option.label}`}
+                  data-subtitle-option={option.index}
+                  role="menuitemradio"
+                  aria-checked={selected}
+                  className={cn(
+                    'w-full flex items-center justify-between gap-3 rounded-xl px-4 py-3.5 text-left text-base border-none tap-none',
+                    focused ? 'bg-white/15 text-white' : 'bg-transparent text-[#ddd]',
+                    selected && 'text-accent'
+                  )}
+                  onClick={() => chooseSubtitle(option.index)}
+                  onMouseEnter={() => setSubtitleMenuCursor(optionIndex)}
+                >
+                  <span>{option.label}</span>
+                  {selected && <span aria-hidden="true">✓</span>}
+                </button>
+              );
+            })}
           </div>
         )}
 
@@ -809,6 +899,22 @@ export default function Player() {
                       <path d="M5 17H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-1" />
                       <polygon points="12 15 17 21 7 21 12 15" fill="currentColor" />
                     </svg>
+                  </button>
+                )}
+                {SHOW_OSD_CONTROLS && subtitleTracks.length > 0 && (
+                  <button
+                    data-subtitles-button
+                    className={cn(
+                      'flex items-center justify-center w-10 h-10 rounded-lg border-none bg-transparent shrink-0 tap-none cursor-pointer active:opacity-60',
+                      currentSubtitleIndex === -1 ? 'text-white' : 'text-accent bg-white/[0.08]'
+                    )}
+                    onClick={handleSubtitleButton}
+                    title={currentSubtitleIndex === -1 ? 'Subtitles off' : `Subtitles: ${currentSubtitleLabel || 'On'}`}
+                    aria-label="Subtitles"
+                    aria-haspopup="menu"
+                    aria-expanded={showSubtitleMenu}
+                  >
+                    <span className="text-[12px] font-bold tracking-tight border border-current rounded px-1 py-0.5">CC</span>
                   </button>
                 )}
                 {SHOW_OSD_CONTROLS && (
@@ -924,12 +1030,12 @@ export default function Player() {
               {IS_TV && (
                 <div className="flex items-center gap-4 mt-1 text-sm text-[#555]">
                   <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-[#ef4444] mr-1.5 align-middle" />Refresh</span>
-                  <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-[#22c55e] mr-1.5 align-middle" />{currentSubtitleIndex === -1 ? 'Subs Off' : `Subs: ${subtitleTracks[currentSubtitleIndex]?.label || 'On'}`}</span>
+                  <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-[#22c55e] mr-1.5 align-middle" />{currentSubtitleIndex === -1 ? 'Subtitles' : `Subs: ${currentSubtitleLabel || 'On'}`}</span>
                 </div>
               )}
               {!MOBILE && !IS_TV && (
                 <span className="text-sm text-[#555] mt-1 block">
-                  {currentSubtitleIndex === -1 ? 'Subs: Off' : `Subs: ${subtitleTracks[currentSubtitleIndex]?.label || 'On'}`}
+                  {currentSubtitleIndex === -1 ? 'Subs: Off' : `Subs: ${currentSubtitleLabel || 'On'}`}
                 </span>
               )}
 

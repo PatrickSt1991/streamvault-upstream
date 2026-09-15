@@ -4,6 +4,7 @@
  * HTML5Player uses a standard HTMLVideoElement for browser-based development.
  */
 import { useAppStore } from '../stores/appStore';
+import { normalizeSubtitleLanguage } from '../utils/subtitles';
 
 const toast = (msg: string) => useAppStore.getState().showToastMessage(msg);
 
@@ -23,7 +24,34 @@ export interface PlayerBackend {
   getDuration(): number;
   getCurrentTime(): number;
   getSubtitleTracks(): SubtitleTrack[];
+  refreshSubtitleTracks(): SubtitleTrack[];
   setSubtitleTrack(index: number): void;
+}
+
+interface TizenTrackInfo {
+  type: 'AUDIO' | 'VIDEO' | 'TEXT';
+  index: number;
+  extra_info?: string;
+}
+
+export function parseTizenSubtitleTracks(trackInfo: TizenTrackInfo[]): SubtitleTrack[] {
+  return trackInfo
+    .filter((track) => track.type === 'TEXT' && Number.isInteger(track.index))
+    .map((track) => {
+      let extra: { track_lang?: unknown; language?: unknown; title?: unknown } = {};
+      try {
+        extra = track.extra_info ? JSON.parse(track.extra_info) as typeof extra : {};
+      } catch { /* malformed firmware metadata: use a stable fallback */ }
+      const rawLanguage = extra.track_lang ?? extra.language;
+      const language = normalizeSubtitleLanguage(rawLanguage);
+      const title = typeof extra.title === 'string' ? extra.title.trim() : '';
+      const titleIsCode = title.toLowerCase() === String(rawLanguage || '').toLowerCase();
+      return {
+        index: track.index,
+        language: language.code,
+        label: title && !titleIsCode ? title : language.label,
+      };
+    });
 }
 
 /**
@@ -32,9 +60,7 @@ export interface PlayerBackend {
  */
 export class TizenPlayer implements PlayerBackend {
   private prepared: boolean = false;
-  private subtitleTracks: SubtitleTrack[] = [
-    { index: 0, language: 'default', label: 'Subtitles' },
-  ];
+  private subtitleTracks: SubtitleTrack[] = [];
   private subtitlesSuppressed: boolean = false;
   private static displayRectSet: boolean = false;
   onSubtitleText?: (text: string) => void;
@@ -55,7 +81,7 @@ export class TizenPlayer implements PlayerBackend {
         TizenPlayer.displayRectSet = true;
       }
 
-      this.subtitleTracks = [{ index: 0, language: 'default', label: 'Subtitles' }];
+      this.subtitleTracks = [];
       this.subtitlesSuppressed = false;
 
       // Prepare asynchronously and auto-play on success
@@ -181,15 +207,25 @@ export class TizenPlayer implements PlayerBackend {
     return this.subtitleTracks;
   }
 
+  refreshSubtitleTracks(): SubtitleTrack[] {
+    try {
+      this.subtitleTracks = parseTizenSubtitleTracks(webapis.avplay.getTotalTrackInfo?.() || []);
+    } catch (err) {
+      toast(`Subtitle discovery failed: ${err}`);
+      this.subtitleTracks = [];
+    }
+    return this.subtitleTracks;
+  }
+
   setSubtitleTrack(index: number): void {
     this.subtitlesSuppressed = index === -1;
-    // Best-effort native mute. Affects external/in-stream text subs only;
-    // CEA-608/708 closed captions are controlled by the TV's accessibility
-    // settings and cannot be disabled from a web app on Tizen.
     try {
       webapis.avplay.setSilentSubtitle?.(this.subtitlesSuppressed);
+      if (!this.subtitlesSuppressed) {
+        webapis.avplay.setSelectTrack?.('TEXT', index);
+      }
     } catch (err) {
-      toast(`setSilentSubtitle failed: ${err}`);
+      toast(`Subtitle selection failed: ${err}`);
     }
     if (this.subtitlesSuppressed) {
       this.onSubtitleText?.('');
@@ -315,6 +351,10 @@ export class HTML5Player implements PlayerBackend {
       });
     }
     return tracks;
+  }
+
+  refreshSubtitleTracks(): SubtitleTrack[] {
+    return this.getSubtitleTracks();
   }
 
   setSubtitleTrack(index: number): void {

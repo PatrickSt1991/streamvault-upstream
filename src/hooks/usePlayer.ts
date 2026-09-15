@@ -2,13 +2,22 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import type MpegtsType from 'mpegts.js';
 import { usePlayerStore } from '../stores/playerStore';
 import { useChannelStore } from '../stores/channelStore';
-import type { PlayerState } from '../types';
+import type { PlayerState, Channel } from '../types';
 import type { SubtitleTrack } from '../services/avplay';
 import { TizenPlayer } from '../services/avplay';
-import { saveWatchProgress, getWatchProgress, getSubtitlesEnabled, setSubtitlesEnabled } from '../services/channel-service';
+import { saveWatchProgress, getWatchProgress, getSubtitlesEnabled, setSubtitlesEnabled, getSubtitleLanguage, setSubtitleLanguage } from '../services/channel-service';
 import { clientLogger as log } from '../utils/logger';
 import { useAppStore } from '../stores/appStore';
-import { browserTranscodePath, iphoneVodPlaybackPath, toAbsolutePlayerUrl } from '../utils/stream-url';
+import { browserTranscodePath, iphoneVodPlaybackPath, normalizePlaybackStart, subtitleMetadataPath, subtitleTrackPath, toAbsolutePlayerUrl } from '../utils/stream-url';
+import {
+  BrowserSubtitleSession,
+  applyHtml5SubtitleSelection,
+  getBrowserSubtitleTiming,
+  getHtml5SubtitleTracks,
+  mapExtractedSubtitleCueTimes,
+  selectPreferredSubtitleTrack,
+} from '../utils/subtitles';
+import { streamWebVttCues } from '../utils/webvtt-stream';
 import { isAppleMobile } from '../utils/platform';
 import { getHtml5WatchProgress, getResumePosition } from '../utils/media-progress';
 import { LiveStreamRecovery } from '../utils/live-stream-recovery';
@@ -28,6 +37,81 @@ let bgProgressInterval: ReturnType<typeof setInterval> | null = null;
 let bgBufferTimer: ReturnType<typeof setTimeout> | null = null;
 let html5PlaybackGeneration = 0;
 let restartActiveLiveStream: (() => void) | null = null;
+let activeBrowserSubtitleController: AbortController | null = null;
+let activeBrowserTextTrack: TextTrack | null = null;
+const browserProgrammaticTextTracks = new WeakSet<TextTrack>();
+const browserSubtitleSession = new BrowserSubtitleSession();
+
+function clearBrowserSubtitleTrack(): void {
+  activeBrowserSubtitleController?.abort();
+  activeBrowserSubtitleController = null;
+  if (activeBrowserTextTrack) {
+    activeBrowserTextTrack.mode = 'disabled';
+    const cues = activeBrowserTextTrack.cues;
+    if (cues) {
+      while (cues.length > 0) activeBrowserTextTrack.removeCue(cues[0]);
+    }
+  }
+  activeBrowserTextTrack = null;
+}
+
+function subtitleDirectUrl(channel: Channel): string | undefined {
+  return channel.id.startsWith('episode_') ? channel.url : undefined;
+}
+
+async function fetchBrowserSubtitleTracks(channel: Channel, apiBaseUrl: string): Promise<SubtitleTrack[]> {
+  const iosFallback = isAppleMobile() && channel.contentType === 'movies';
+  const response = await fetch(`${apiBaseUrl}${subtitleMetadataPath(channel.id, subtitleDirectUrl(channel), iosFallback)}`, {
+    cache: 'no-store',
+  });
+  if (!response.ok) throw new Error(`Subtitle discovery failed (${response.status})`);
+  const payload = await response.json() as { tracks?: unknown };
+  if (!Array.isArray(payload.tracks)) return [];
+  return payload.tracks.filter((track): track is SubtitleTrack => {
+    if (!track || typeof track !== 'object') return false;
+    const value = track as Partial<SubtitleTrack>;
+    return Number.isInteger(value.index) && typeof value.language === 'string' && typeof value.label === 'string';
+  });
+}
+
+function startBrowserSubtitleTrack(
+  video: HTMLVideoElement,
+  channel: Channel,
+  track: SubtitleTrack,
+  apiBaseUrl: string,
+  timing = getBrowserSubtitleTiming(Number(video.dataset.streamOffset || '0'), video.currentTime),
+): void {
+  clearBrowserSubtitleTrack();
+  const controller = new AbortController();
+  const textTrack = video.addTextTrack('subtitles', track.label, track.language);
+  browserProgrammaticTextTracks.add(textTrack);
+  const url = `${apiBaseUrl}${subtitleTrackPath(
+    channel.id,
+    track.index,
+    subtitleDirectUrl(channel),
+    timing.extractionStart,
+    isAppleMobile() && channel.contentType === 'movies',
+  )}`;
+  textTrack.mode = 'showing';
+  activeBrowserSubtitleController = controller;
+  activeBrowserTextTrack = textTrack;
+
+  void streamWebVttCues(url, controller.signal, (cue) => {
+    if (activeBrowserSubtitleController !== controller) return;
+    try {
+      const cueTimes = mapExtractedSubtitleCueTimes(cue.startTime, cue.endTime, timing);
+      if (!cueTimes) return;
+      textTrack.addCue(new VTTCue(cueTimes.startTime, cueTimes.endTime, cue.text));
+    } catch (error) {
+      log.warn('Subtitle cue rejected', error);
+    }
+  }).catch((error) => {
+    if (controller.signal.aborted) return;
+    log.warn('Subtitle stream failed', error);
+    toast('Could not load the selected subtitles');
+  });
+}
+
 
 const liveStreamRecovery = new LiveStreamRecovery((reason, attempt) => {
   log.warn(`Live stream: ${reason} — reconnecting (attempt ${attempt})`);
@@ -158,6 +242,8 @@ function stopPlayback() {
   stopBgProgressTracking();
   html5PlaybackGeneration += 1;
   disableLiveStreamRecovery();
+  clearBrowserSubtitleTrack();
+  browserSubtitleSession.clear();
 
   if (bgBufferTimer) { clearTimeout(bgBufferTimer); bgBufferTimer = null; }
 
@@ -180,6 +266,7 @@ function stopPlayback() {
     if (v) {
       v.pause();
       v.removeAttribute('src');
+      delete v.dataset.channelId;
       v.load();
     }
   }
@@ -224,16 +311,21 @@ export function usePlayer(): {
   subtitleTracks: SubtitleTrack[];
   currentSubtitleIndex: number;
   subtitleText: string;
-  cycleSubtitles: () => void;
+  selectSubtitleTrack: (index: number) => void;
 } {
   const store = usePlayerStore();
-  const [subtitleTracks, setSubtitleTracks] = useState<SubtitleTrack[]>([]);
-  const [currentSubtitleIndex, setCurrentSubtitleIndex] = useState(-1);
-  const [subtitleText, setSubtitleText] = useState('');
+  const restoredBrowserSubtitles = browserSubtitleSession.forChannel(
+    usePlayerStore.getState().currentChannel?.id,
+  );
+  const [subtitleTracks, setSubtitleTracks] = useState<SubtitleTrack[]>(restoredBrowserSubtitles.tracks);
+  const [currentSubtitleIndex, setCurrentSubtitleIndex] = useState(restoredBrowserSubtitles.selectedIndex);
+  const [subtitleText, setSubtitleText] = useState(restoredBrowserSubtitles.text);
   const playerRef = useRef<TizenPlayer | null>(null);
-  // Mirrors the persisted global subtitles preference. Defaults to false
-  // so the server's live stream proxy strips embedded CEA-608/708 captions
-  // and HTML5 text tracks start hidden. Flipped by cycleSubtitles.
+  const subtitleTracksRef = useRef<SubtitleTrack[]>(restoredBrowserSubtitles.tracks);
+  const selectedSubtitleIndexRef = useRef(restoredBrowserSubtitles.selectedIndex);
+  // Mirrors the persisted global subtitles preference. Defaults to false;
+  // browser live playback still carries captions so it can expose only tracks
+  // that the media element actually detects, with Off enforced by track mode.
   const keepSubsRef = useRef(getSubtitlesEnabled());
 
   const play = useCallback(() => {
@@ -253,7 +345,7 @@ export function usePlayer(): {
     const savedProgress = channel.contentType !== 'livetv'
       ? getWatchProgress(channel.id)
       : null;
-    const resumePosition = getResumePosition(savedProgress);
+    const resumePosition = normalizePlaybackStart(getResumePosition(savedProgress));
     if (resumePosition > 0) {
       log.info(`Resuming from position ${resumePosition.toFixed(1)}s`);
     }
@@ -262,20 +354,20 @@ export function usePlayer(): {
 
     // Try AVPlay first (Samsung Tizen), fallback to HTML5 video
     if (typeof webapis !== 'undefined' && webapis.avplay) {
+      browserSubtitleSession.clear();
       log.info('Using Tizen AVPlay backend');
       const isLive = channel.contentType === 'livetv';
       try {
         const avplay = webapis.avplay;
         clearAvplayStallTimer();
         avplay.close();
-        // Route through the server proxy so live streams get subtitle PIDs
-        // stripped via ffmpeg. Recordings have a server-relative URL; live
-        // and VOD go through /api/stream/. Episodes carry the URL as a
-        // query param via getStreamUrl().
+        // Route through the server proxy for every media type. Tizen live
+        // playback retains subtitle data so AVPlay can inventory real TEXT
+        // tracks; setSilentSubtitle enforces the persisted Off state.
         const isRecording = channel.id.startsWith('recording_');
         const playerPath = isRecording
           ? channel.url
-          : getStreamUrl(channel.id, channel.url, keepSubsRef.current, isLive, audioOnly);
+          : getStreamUrl(channel.id, channel.url, isLive ? true : keepSubsRef.current, isLive, audioOnly);
         const tizenPlayUrl = toAbsolutePlayerUrl(
           playerPath,
           useChannelStore.getState().apiBaseUrl
@@ -375,8 +467,17 @@ export function usePlayer(): {
             }
             avplay.play();
             setStatus('playing');
-            setSubtitleTracks(tizenPlayer.getSubtitleTracks());
-            setCurrentSubtitleIndex(keepSubsRef.current ? 0 : -1);
+            const tracks = tizenPlayer.refreshSubtitleTracks();
+            subtitleTracksRef.current = tracks;
+            setSubtitleTracks(tracks);
+            const selectedIndex = selectPreferredSubtitleTrack(
+              tracks,
+              keepSubsRef.current,
+              getSubtitleLanguage(),
+            );
+            selectedSubtitleIndexRef.current = selectedIndex;
+            setCurrentSubtitleIndex(selectedIndex);
+            tizenPlayer.setSubtitleTrack(selectedIndex);
             startBgProgressTracking();
             setupMediaSession(channel.name);
           },
@@ -402,6 +503,7 @@ export function usePlayer(): {
       }
 
       const isLiveTs = channel.contentType === 'livetv';
+      video.dataset.channelId = channel.id;
       const playbackGeneration = ++html5PlaybackGeneration;
       const isCurrentPlayback = () => playbackGeneration === html5PlaybackGeneration;
       if (isLiveTs) {
@@ -415,6 +517,15 @@ export function usePlayer(): {
       log.info(`HTML5: found video element, readyState=${video.readyState}, networkState=${video.networkState}`);
 
       // Clean up any previous playback state
+      clearBrowserSubtitleTrack();
+      video.textTracks.onaddtrack = null;
+      video.textTracks.onremovetrack = null;
+      browserSubtitleSession.replace(channel.id, [], -1);
+      subtitleTracksRef.current = [];
+      selectedSubtitleIndexRef.current = -1;
+      setSubtitleTracks([]);
+      setCurrentSubtitleIndex(-1);
+      setSubtitleText('');
       if (activeMpegtsPlayer) {
         log.info('HTML5: destroying previous mpegts.js instance');
         const previousPlayer = activeMpegtsPlayer;
@@ -501,22 +612,6 @@ export function usePlayer(): {
           setStatus('idle');
           clearMediaSession();
         };
-        video.textTracks.onaddtrack = () => {
-          const tracks: SubtitleTrack[] = [];
-          for (let i = 0; i < video.textTracks.length; i++) {
-            const t = video.textTracks[i];
-            tracks.push({ index: i, language: t.language || 'unknown', label: t.label || `Track ${i + 1}` });
-          }
-          setSubtitleTracks(tracks);
-          // Honor the global subtitles preference — iOS Safari and other
-          // browsers may auto-show a default text track otherwise.
-          const wantSubs = keepSubsRef.current;
-          const targetIdx = wantSubs && tracks.length > 0 ? 0 : -1;
-          for (let i = 0; i < video.textTracks.length; i++) {
-            video.textTracks[i].mode = i === targetIdx ? 'showing' : 'hidden';
-          }
-          setCurrentSubtitleIndex(targetIdx);
-        };
       };
 
       const isRecording = channel.id.startsWith('recording_');
@@ -532,13 +627,30 @@ export function usePlayer(): {
           ? `${apiBaseUrl}${appleMobileVodPath}`
             : needsBrowserTranscode
             ? `${apiBaseUrl}${browserTranscodePath(channel.id, channel.id.startsWith('episode_') ? channel.url : undefined, resumePosition)}`
-            : getStreamUrl(channel.id, channel.url, false, isLiveTs, audioOnly);
+            : getStreamUrl(channel.id, channel.url, isLiveTs ? true : keepSubsRef.current, isLiveTs, audioOnly);
       log.info(`HTML5: playUrl=${playUrl}, contentType=${channel.contentType}`);
 
       if (isLiveTs) {
         // Live TV: MPEG-TS stream — use mpegts.js to demux in browser
         log.info('HTML5: loading mpegts.js for live MPEG-TS playback...');
         setupEvents();
+        const syncLiveSubtitleTracks = () => {
+          if (!isCurrentPlayback()) return;
+          const tracks = getHtml5SubtitleTracks(
+            video.textTracks,
+            (textTrack) => !browserProgrammaticTextTracks.has(textTrack),
+          );
+          const selectedIndex = selectPreferredSubtitleTrack(
+            tracks,
+            keepSubsRef.current,
+            getSubtitleLanguage(),
+          );
+          applyHtml5SubtitleSelection(video, selectedIndex);
+          browserSubtitleSession.replace(channel.id, tracks, selectedIndex);
+        };
+        video.textTracks.onaddtrack = syncLiveSubtitleTracks;
+        video.textTracks.onremovetrack = syncLiveSubtitleTracks;
+        syncLiveSubtitleTracks();
         import('mpegts.js').then(({ default: mpegts }) => {
           if (!isCurrentPlayback()) return;
           log.info(`HTML5: mpegts.js loaded, isSupported=${mpegts.isSupported()}`);
@@ -616,12 +728,30 @@ export function usePlayer(): {
         video.dataset.streamOffset = needsBrowserTranscode || appleMobileVodPath ? String(resumePosition) : '0';
         video.src = playUrl;
         video.load();
+
+        if (!isRecording) {
+          void fetchBrowserSubtitleTracks(channel, apiBaseUrl).then((tracks) => {
+            if (!isCurrentPlayback()) return;
+            const selectedIndex = selectPreferredSubtitleTrack(
+              tracks,
+              keepSubsRef.current,
+              getSubtitleLanguage(),
+            );
+            const selectedTrack = tracks.find((track) => track.index === selectedIndex);
+            if (selectedTrack) startBrowserSubtitleTrack(video, channel, selectedTrack, apiBaseUrl);
+            browserSubtitleSession.replace(channel.id, tracks, selectedIndex);
+          }).catch((error) => {
+            if (isCurrentPlayback()) log.warn('Subtitle discovery failed', error);
+          });
+        }
       }
     }
   }, []);
 
   const stop = useCallback(() => {
     playerRef.current = null;
+    subtitleTracksRef.current = [];
+    selectedSubtitleIndexRef.current = -1;
     setSubtitleTracks([]);
     setCurrentSubtitleIndex(-1);
     setSubtitleText('');
@@ -635,38 +765,40 @@ export function usePlayer(): {
     play();
   }, [play]);
 
-  const cycleSubtitles = useCallback(() => {
-    if (subtitleTracks.length === 0) return;
+  const selectSubtitleTrack = useCallback((index: number) => {
+    const channel = usePlayerStore.getState().currentChannel;
+    if (!channel) return;
+    const track = subtitleTracksRef.current.find((candidate) => candidate.index === index);
+    if (index !== -1 && !track) return;
 
-    const nextIndex =
-      currentSubtitleIndex === -1
-        ? 0
-        : currentSubtitleIndex + 1 >= subtitleTracks.length
-          ? -1
-          : currentSubtitleIndex + 1;
+    const enabled = index !== -1;
+    keepSubsRef.current = enabled;
+    selectedSubtitleIndexRef.current = index;
+    setSubtitlesEnabled(enabled);
+    if (track) setSubtitleLanguage(track.language);
+    setCurrentSubtitleIndex(index);
+    setSubtitleText('');
 
-    setCurrentSubtitleIndex(nextIndex);
-
-    const wantSubs = nextIndex !== -1;
-    keepSubsRef.current = wantSubs;
-    setSubtitlesEnabled(wantSubs);
-
+    const isLive = channel.contentType === 'livetv';
     if (typeof webapis !== 'undefined' && webapis.avplay) {
-      // Tizen: subs are stripped server-side, so toggle the proxy mode
-      // and reopen the stream with the new URL. AVPlay's own subtitle
-      // controls don't reach embedded CC, so reload is the only path.
-      play();
-    } else {
-      // HTML5: drive the video element's text tracks directly.
-      const video = document.getElementById('av-player') as HTMLVideoElement | null;
-      if (video) {
-        for (let i = 0; i < video.textTracks.length; i++) {
-          video.textTracks[i].mode = i === nextIndex ? 'showing' : 'hidden';
-        }
-      }
-      playerRef.current?.setSubtitleTrack(nextIndex);
+      playerRef.current?.setSubtitleTrack(index);
+      return;
     }
-  }, [subtitleTracks, currentSubtitleIndex, play]);
+
+    browserSubtitleSession.select(channel.id, index);
+    const video = document.getElementById('av-player') as HTMLVideoElement | null;
+    if (isLive) {
+      if (video) applyHtml5SubtitleSelection(video, index);
+      return;
+    }
+    if (!track) {
+      clearBrowserSubtitleTrack();
+      return;
+    }
+    if (video) {
+      startBrowserSubtitleTrack(video, channel, track, useChannelStore.getState().apiBaseUrl);
+    }
+  }, []);
 
   const togglePlay = useCallback(() => {
     if (typeof webapis !== 'undefined' && webapis.avplay) {
@@ -691,30 +823,47 @@ export function usePlayer(): {
   }, []);
 
   const seek = useCallback((time: number) => {
+    const targetTime = normalizePlaybackStart(time);
     if (typeof webapis !== 'undefined' && webapis.avplay) {
-      try { webapis.avplay.seekTo(time * 1000); } catch (err) { toast(`Seek failed: ${err}`); }
+      try { webapis.avplay.seekTo(targetTime * 1000); } catch (err) { toast(`Seek failed: ${err}`); }
     } else {
       const video = document.getElementById('av-player') as HTMLVideoElement | null;
       const channel = usePlayerStore.getState().currentChannel;
       if (!video || !channel) return;
       const appleMobileVodPath = isAppleMobile()
-        ? iphoneVodPlaybackPath(channel.id, channel.url, channel.contentType, time)
+        ? iphoneVodPlaybackPath(channel.id, channel.url, channel.contentType, targetTime)
         : null;
       const usesTranscode = channel.contentType !== 'livetv' && !channel.id.startsWith('recording_') && !appleMobileVodPath;
+      const restartSelectedSubtitles = () => {
+        const track = subtitleTracksRef.current.find(
+          (candidate) => candidate.index === selectedSubtitleIndexRef.current,
+        );
+        if (track) {
+          startBrowserSubtitleTrack(
+            video,
+            channel,
+            track,
+            useChannelStore.getState().apiBaseUrl,
+            getBrowserSubtitleTiming(targetTime, 0),
+          );
+        }
+      };
       if (appleMobileVodPath) {
         const apiBaseUrl = useChannelStore.getState().apiBaseUrl;
-        video.dataset.streamOffset = String(time);
+        video.dataset.streamOffset = String(targetTime);
         video.src = `${apiBaseUrl}${appleMobileVodPath}`;
         video.load();
+        restartSelectedSubtitles();
         video.play().catch(() => {});
       } else if (usesTranscode) {
         const apiBaseUrl = useChannelStore.getState().apiBaseUrl;
-        video.dataset.streamOffset = String(time);
-        video.src = `${apiBaseUrl}${browserTranscodePath(channel.id, channel.id.startsWith('episode_') ? channel.url : undefined, time)}`;
+        video.dataset.streamOffset = String(targetTime);
+        video.src = `${apiBaseUrl}${browserTranscodePath(channel.id, channel.id.startsWith('episode_') ? channel.url : undefined, targetTime)}`;
         video.load();
+        restartSelectedSubtitles();
         video.play().catch(() => {});
       } else {
-        video.currentTime = time;
+        video.currentTime = targetTime;
       }
     }
   }, []);
@@ -725,6 +874,22 @@ export function usePlayer(): {
 
   // No auto-cleanup on unmount — video keeps playing in background.
   // Playback is only stopped by explicit stop() call (back button, Media Session, etc.)
+
+  useEffect(() => {
+    const syncBrowserSubtitleSession = () => {
+      const snapshot = browserSubtitleSession.forChannel(
+        usePlayerStore.getState().currentChannel?.id,
+      );
+      subtitleTracksRef.current = snapshot.tracks;
+      selectedSubtitleIndexRef.current = snapshot.selectedIndex;
+      setSubtitleTracks(snapshot.tracks);
+      setCurrentSubtitleIndex(snapshot.selectedIndex);
+      setSubtitleText(snapshot.text);
+    };
+    const unsubscribe = browserSubtitleSession.subscribe(syncBrowserSubtitleSession);
+    syncBrowserSubtitleSession();
+    return unsubscribe;
+  }, []);
 
   // Sync media session playback state with video pause/play
   useEffect(() => {
@@ -756,6 +921,6 @@ export function usePlayer(): {
     subtitleTracks,
     currentSubtitleIndex,
     subtitleText,
-    cycleSubtitles,
+    selectSubtitleTrack,
   };
 }

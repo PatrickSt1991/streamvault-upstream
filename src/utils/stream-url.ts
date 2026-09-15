@@ -12,10 +12,16 @@ export function vodRemuxPath(channelId: string): string {
   return `/api/remux/${encodeURIComponent(channelId)}`;
 }
 
+export function normalizePlaybackStart(startSeconds: number): number {
+  if (!Number.isFinite(startSeconds) || startSeconds <= 0) return 0;
+  return Math.round(startSeconds * 1000) / 1000;
+}
+
 export function iosHlsPath(channelId: string, directUrl: string, startSeconds = 0, contentType?: string): string {
   const path = `/api/ios-hls-authorize/${encodeURIComponent(channelId)}/index.m3u8`;
   const params = new URLSearchParams({ url: directUrl });
-  if (startSeconds > 0) params.set('start', String(Math.floor(startSeconds)));
+  const normalizedStart = normalizePlaybackStart(startSeconds);
+  if (normalizedStart > 0) params.set('start', String(normalizedStart));
   if (contentType === 'movies') params.set('type', 'movies');
   return `${path}?${params.toString()}`;
 }
@@ -37,7 +43,32 @@ export function browserTranscodePath(channelId: string, directUrl?: string, star
   const path = `/api/transcode/${encodeURIComponent(channelId)}`;
   const params = new URLSearchParams();
   if (directUrl) params.set('url', directUrl);
-  if (startSeconds > 0) params.set('start', String(Math.floor(startSeconds)));
+  const normalizedStart = normalizePlaybackStart(startSeconds);
+  if (normalizedStart > 0) params.set('start', String(normalizedStart));
   const query = params.toString();
+  return query ? `${path}?${query}` : path;
+}
+
+function subtitleParams(directUrl?: string, startSeconds = 0, iosFallback = false): URLSearchParams {
+  const params = new URLSearchParams();
+  if (directUrl) {
+    params.set('url', directUrl);
+    params.set('type', 'series');
+  }
+  const normalizedStart = normalizePlaybackStart(startSeconds);
+  if (normalizedStart > 0) params.set('start', String(normalizedStart));
+  if (iosFallback) params.set('ios', '1');
+  return params;
+}
+
+export function subtitleMetadataPath(channelId: string, directUrl?: string, iosFallback = false): string {
+  const path = `/api/subtitles/${encodeURIComponent(channelId)}`;
+  const query = subtitleParams(directUrl, 0, iosFallback).toString();
+  return query ? `${path}?${query}` : path;
+}
+
+export function subtitleTrackPath(channelId: string, streamIndex: number, directUrl?: string, startSeconds = 0, iosFallback = false): string {
+  const path = `/api/subtitles/${encodeURIComponent(channelId)}/${streamIndex}.vtt`;
+  const query = subtitleParams(directUrl, startSeconds, iosFallback).toString();
   return query ? `${path}?${query}` : path;
 }

@@ -23,7 +23,7 @@ export function iosHlsProcessExitState(
 }
 
 export function iosHlsSessionKey(channelId: string, sourceUrl: string, startSeconds: number): string {
-  return `${channelId}\n${sourceUrl}\n${Math.floor(startSeconds)}`;
+  return `${channelId}\n${sourceUrl}\n${startSeconds}`;
 }
 
 export function findReusableIosHlsSession(

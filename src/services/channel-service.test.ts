@@ -4,8 +4,10 @@ import {
   getContinueWatchingIds,
   getLatestSeriesProgress,
   getSeriesWatchProgress,
+  getSubtitleLanguage,
   getWatchProgress,
   saveWatchProgress,
+  setSubtitleLanguage,
 } from './channel-service';
 
 const storage = new Map<string, string>();
@@ -105,5 +107,11 @@ describe('watch progress', () => {
 
     expect(getLatestSeriesProgress('series_2963')?.channelId).toBe('episode_1');
     expect(Object.keys(getSeriesWatchProgress('series_2963')).sort()).toEqual(['episode_1', 'episode_2']);
+  });
+
+  it('persists the preferred subtitle language independently of on/off state', () => {
+    expect(getSubtitleLanguage()).toBeNull();
+    setSubtitleLanguage('sv');
+    expect(getSubtitleLanguage()).toBe('sv');
   });
 });

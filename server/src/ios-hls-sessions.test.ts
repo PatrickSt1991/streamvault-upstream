@@ -24,6 +24,12 @@ describe('iOS HLS session reuse', () => {
     expect(findReusableIosHlsSession(sessions, key)).toBeNull();
   });
 
+  it('does not reuse sessions across distinct fractional seek positions', () => {
+    expect(iosHlsSessionKey('episode_1', 'http://source', 120.125)).not.toBe(
+      iosHlsSessionKey('episode_1', 'http://source', 120.625),
+    );
+  });
+
   it('starts a replacement instead of reusing a failed FFmpeg session', () => {
     const key = iosHlsSessionKey('vod_83608', 'http://provider.example/movie.mkv', 0);
     const sessions = new Map([

@@ -5,6 +5,7 @@ const RECENT_KEY = 'streamvault_recent_channels';
 const LAST_WATCHED_KEY = 'streamvault_last_watched';
 const WATCH_PROGRESS_KEY = 'streamvault_watch_progress';
 const SUBTITLES_ENABLED_KEY = 'streamvault_subtitles_enabled';
+const SUBTITLE_LANGUAGE_KEY = 'streamvault_subtitle_language';
 const MAX_RECENT = 20;
 // Long series can exceed 100 episodes; keep enough history to preserve watched order.
 const MAX_PROGRESS_ENTRIES = 2000;
@@ -165,6 +166,14 @@ export function getSubtitlesEnabled(): boolean {
 
 export function setSubtitlesEnabled(enabled: boolean): void {
   setItem(SUBTITLES_ENABLED_KEY, enabled);
+}
+
+export function getSubtitleLanguage(): string | null {
+  return getItem<string | null>(SUBTITLE_LANGUAGE_KEY, null);
+}
+
+export function setSubtitleLanguage(language: string): void {
+  setItem(SUBTITLE_LANGUAGE_KEY, language);
 }
 
 /**
