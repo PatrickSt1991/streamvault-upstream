@@ -19,6 +19,19 @@ services:
       - STREAMVAULT_PROXY_ALLOWED_HOSTS=${STREAMVAULT_PROXY_ALLOWED_HOSTS:-}
       # Comma-separated explicit CORS origins. Empty keeps current LAN-friendly behavior.
       - STREAMVAULT_ALLOWED_ORIGINS=${STREAMVAULT_ALLOWED_ORIGINS:-}
+    # Leave capacity for SSH, DNS and other host services during transcoding.
+    cpus: "2.5"
+    mem_limit: 2g
+    memswap_limit: 3g
+    pids_limit: 256
+    stop_grace_period: 30s
+    healthcheck:
+      start_period: 5m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
 volumes:

@@ -60,7 +60,7 @@ import {
 } from './subtitles.js';
 import { parseByteRange } from './ranges.js';
 import { allowedProxyHostsFromConfig, maskConfigResponse, normalizeAllowedOrigins, requireAuth, validateExternalHttpUrl } from './security.js';
-import { isDatabaseCorruptionError } from './db-lifecycle.js';
+import { isDatabaseCorruptionError, stopDatabaseBackupWorker } from './db-lifecycle.js';
 import {
   ConcurrentStreamLimiter,
   LIVE_MPEG_TS_CONTENT_TYPE,
@@ -1929,9 +1929,18 @@ function shutdown(signal: string): void {
   }, 8000);
   forceExit.unref();
 
-  httpServer.close(err => {
-    if (err) logger.error(`HTTP server close error: ${err.message}`);
-    else logger.info('HTTP server closed');
+  const backupShutdown = stopDatabaseBackupWorker().catch(error => {
+    logger.warn(`Backup worker shutdown failed: ${error instanceof Error ? error.message : error}`);
+  });
+  const httpShutdown = new Promise<void>(resolve => {
+    httpServer.close(err => {
+      if (err) logger.error(`HTTP server close error: ${err.message}`);
+      else logger.info('HTTP server closed');
+      resolve();
+    });
+  });
+
+  void Promise.all([backupShutdown, httpShutdown]).then(() => {
     closeDatabase();
     clearTimeout(forceExit);
     process.exit(0);

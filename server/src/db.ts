@@ -3,10 +3,12 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { logger } from './logger.js';
+import { ensureBrowseIndexes } from './db-indexes.js';
+import { createCategorySnapshotWriter } from './channel-snapshot.js';
 import {
-  createAtomicBackup,
+  backupDatabaseInWorker,
+  checkDatabaseReadable,
   restoreLatestValidBackup,
-  validateDatabaseFile,
   validateOpenDatabase,
 } from './db-lifecycle.js';
 
@@ -130,6 +132,7 @@ try {
 }
 
 db.exec('CREATE INDEX IF NOT EXISTS idx_channels_added ON channels(added)');
+ensureBrowseIndexes(db);
 
 // ---------- Recording tables ----------
 
@@ -175,7 +178,7 @@ db.exec(`
 
 // ---------- Lifecycle / backup helpers ----------
 
-const BACKUP_RETENTION = 7;
+let backupInFlight: Promise<string | null> | null = null;
 
 export function closeDatabase(): void {
   try {
@@ -192,51 +195,16 @@ export function closeDatabase(): void {
 }
 
 export function getDatabaseHealth(): { ok: boolean; error?: string } {
-  return validateOpenDatabase(db);
+  return checkDatabaseReadable(db);
 }
 
-export function backupDatabase(): string | null {
-  try {
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    const stamp = new Date().toISOString().slice(0, 10);
-    const target = path.join(BACKUP_DIR, `streamvault-${stamp}.db`);
-    // Build and validate a temporary snapshot, then atomically replace today's
-    // backup. A failed VACUUM must never erase the last known-good snapshot.
-    createAtomicBackup(db, target);
-    logger.info(`Database backed up to ${target}`);
-
-    // Invalid snapshots (including legacy zero-byte files) are not backups and
-    // must not displace valid files from retention.
-    const datedFiles = fs.readdirSync(BACKUP_DIR)
-      .filter(f => f.startsWith('streamvault-') && f.endsWith('.db'));
-    const validFiles: string[] = [];
-    for (const file of datedFiles) {
-      const fullPath = path.join(BACKUP_DIR, file);
-      if (validateDatabaseFile(fullPath).ok) {
-        validFiles.push(file);
-      } else {
-        fs.unlinkSync(fullPath);
-        logger.warn(`Pruned invalid backup ${file}`);
-      }
-    }
-
-    // Retention: keep the newest BACKUP_RETENTION validated snapshots.
-    const files = validFiles
-      .map(f => ({ f, mtime: fs.statSync(path.join(BACKUP_DIR, f)).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime);
-    for (const old of files.slice(BACKUP_RETENTION)) {
-      try {
-        fs.unlinkSync(path.join(BACKUP_DIR, old.f));
-        logger.info(`Pruned old backup ${old.f}`);
-      } catch (e) {
-        logger.warn(`Failed to prune ${old.f}: ${e instanceof Error ? e.message : e}`);
-      }
-    }
-    return target;
-  } catch (err) {
-    logger.error(`Backup failed: ${err instanceof Error ? err.message : err}`);
-    return null;
-  }
+export function backupDatabase(): Promise<string | null> {
+  if (backupInFlight) return backupInFlight;
+  backupInFlight = backupDatabaseInWorker(DB_PATH, BACKUP_DIR, warning => logger.warn(warning))
+    .then(target => { logger.info(`Database backed up to ${target}`); return target; })
+    .catch(error => { logger.error(`Backup failed: ${error.message}`); return null; })
+    .finally(() => { backupInFlight = null; });
+  return backupInFlight;
 }
 
 // ---------- Config helpers ----------
@@ -349,17 +317,10 @@ export function clearCachedStreams(): void {
   logger.info('Cleared all cached streams');
 }
 
-const clearChannelsByCategory = db.prepare('DELETE FROM channels WHERE category_id = ?');
-
-const insertChannelsForCategory = db.transaction((categoryId: string, channels: DBChannel[]) => {
-  clearChannelsByCategory.run(categoryId);
-  for (const ch of channels) {
-    insertChannel.run(ch.id, ch.name, ch.url, ch.logo, ch.grp, ch.region, ch.content_type, ch.category_id || '', ch.sort_order ?? 0, ch.added ?? 0);
-  }
-});
+const writeCategorySnapshot = createCategorySnapshotWriter(db);
 
 export function saveChannelsForCategory(categoryId: string, channels: DBChannel[]): void {
-  insertChannelsForCategory(categoryId, channels);
+  writeCategorySnapshot(categoryId, channels);
 }
 
 export function getChannelById(id: string): DBChannel | undefined {

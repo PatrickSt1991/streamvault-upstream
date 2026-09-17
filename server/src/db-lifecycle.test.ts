@@ -1,13 +1,18 @@
+// @vitest-environment node
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import {
+  backupDatabaseInWorker,
+  checkDatabaseReadable,
   createAtomicBackup,
   findLatestValidBackup,
+  pruneDatabaseBackups,
   restoreLatestValidBackup,
+  stopDatabaseBackupWorker,
   validateDatabaseFile,
 } from './db-lifecycle.js';
 
@@ -97,3 +102,104 @@ test('validation rejects an empty SQLite file with no StreamVault schema', () =>
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('routine health reads schema tables without running an integrity scan', () => {
+  const dir = tempDir();
+  const db = createDb(path.join(dir, 'source.db'), 'healthy');
+  db.pragma = (() => { throw new Error('full scans forbidden in health check'); }) as typeof db.pragma;
+  assert.equal(checkDatabaseReadable(db).ok, true);
+  db.exec('DROP TABLE channels');
+  assert.equal(checkDatabaseReadable(db).ok, false);
+  db.close();
+  assert.equal(checkDatabaseReadable(db).ok, false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('backup worker preserves data and reports failures without replacing a good snapshot', async () => {
+  const dir = tempDir();
+  const source = path.join(dir, 'source.db');
+  createDb(source, 'worker-backup').close();
+  const target = await backupDatabaseInWorker(source, path.join(dir, 'backups'));
+  assert.equal(readMarker(target), 'worker-backup');
+  await assert.rejects(backupDatabaseInWorker(path.join(dir, 'missing.db'), path.join(dir, 'backups')));
+  assert.equal(readMarker(target), 'worker-backup');
+  fs.rmSync(dir, { recursive: true, force: true });
+}, 20_000);
+
+test('backup retention removes invalid snapshots and keeps seven valid snapshots', () => {
+  const dir = tempDir();
+  for (let day = 1; day <= 8; day++) {
+    const date = `2026-01-${String(day).padStart(2, '0')}`;
+    createDb(path.join(dir, `streamvault-${date}.db`), date).close();
+  }
+  const invalid = path.join(dir, 'streamvault-2026-01-09.db');
+  const abandonedTemp = path.join(dir, 'streamvault-2026-01-10.db.tmp-123-456');
+  fs.writeFileSync(invalid, 'not sqlite');
+  fs.writeFileSync(abandonedTemp, 'partial snapshot');
+
+  const warnings = pruneDatabaseBackups(dir);
+
+  assert.deepEqual(warnings, []);
+  assert.equal(fs.existsSync(invalid), false);
+  assert.equal(fs.existsSync(abandonedTemp), false);
+  const retained = fs.readdirSync(dir).filter(name => /^streamvault-.*\.db$/.test(name));
+  assert.equal(retained.length, 7);
+  assert.equal(retained.includes('streamvault-2026-01-01.db'), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('backup retention reports an unlink failure without failing the completed backup', () => {
+  const dir = tempDir();
+  const invalid = path.join(dir, 'streamvault-2026-01-01.db');
+  fs.writeFileSync(invalid, 'not sqlite');
+  const realUnlink = fs.unlinkSync;
+  const unlink = vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+    if (file === invalid) throw new Error('read-only filesystem');
+    return realUnlink(file);
+  });
+
+  try {
+    const warnings = pruneDatabaseBackups(dir);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0] || '', /read-only filesystem/);
+    assert.equal(fs.existsSync(invalid), true);
+  } finally {
+    unlink.mockRestore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an invalid backup directory rejects without leaving the worker active', async () => {
+  const dir = tempDir();
+  const source = path.join(dir, 'source.db');
+  const notDirectory = path.join(dir, 'not-a-directory');
+  createDb(source, 'invalid-backup-dir').close();
+  fs.writeFileSync(notDirectory, 'file');
+
+  await assert.rejects(backupDatabaseInWorker(source, notDirectory));
+  const target = await backupDatabaseInWorker(source, path.join(dir, 'backups'));
+
+  assert.equal(readMarker(target), 'invalid-backup-dir');
+  fs.rmSync(dir, { recursive: true, force: true });
+}, 20_000);
+
+test('stopping the active backup worker waits for exit and removes temporary snapshots', async () => {
+  const dir = tempDir();
+  const source = path.join(dir, 'source.db');
+  const backups = path.join(dir, 'backups');
+  createDb(source, 'stop-worker').close();
+  const outcome = backupDatabaseInWorker(source, backups).then(
+    target => ({ target }),
+    error => ({ error: error as Error }),
+  );
+
+  await stopDatabaseBackupWorker();
+  const result = await outcome;
+
+  assert.ok('error' in result);
+  const leftovers = fs.existsSync(backups)
+    ? fs.readdirSync(backups).filter(name => name.includes('.tmp-'))
+    : [];
+  assert.deepEqual(leftovers, []);
+  fs.rmSync(dir, { recursive: true, force: true });
+}, 20_000);
