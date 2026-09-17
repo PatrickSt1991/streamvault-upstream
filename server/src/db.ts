@@ -8,6 +8,7 @@ import { createCategorySnapshotWriter } from './channel-snapshot.js';
 import {
   backupDatabaseInWorker,
   checkDatabaseReadable,
+  isDatabaseBackupDue,
   restoreLatestValidBackup,
   validateOpenDatabase,
 } from './db-lifecycle.js';
@@ -205,6 +206,14 @@ export function backupDatabase(): Promise<string | null> {
     .catch(error => { logger.error(`Backup failed: ${error.message}`); return null; })
     .finally(() => { backupInFlight = null; });
   return backupInFlight;
+}
+
+export function backupDatabaseIfDue(maxAgeMs: number): Promise<string | null> {
+  if (!isDatabaseBackupDue(BACKUP_DIR, maxAgeMs)) {
+    logger.info('Recent database backup exists; skipping startup backup');
+    return Promise.resolve(null);
+  }
+  return backupDatabase();
 }
 
 // ---------- Config helpers ----------

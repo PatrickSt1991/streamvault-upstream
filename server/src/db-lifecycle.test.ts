@@ -10,6 +10,7 @@ import {
   checkDatabaseReadable,
   createAtomicBackup,
   findLatestValidBackup,
+  isDatabaseBackupDue,
   pruneDatabaseBackups,
   restoreLatestValidBackup,
   stopDatabaseBackupWorker,
@@ -49,6 +50,7 @@ test('atomic backups replace the same-day file only after a valid backup is read
 
   createAtomicBackup(db, target);
   assert.equal(readMarker(target), 'first');
+  assert.equal(fs.existsSync(`${target}.complete`), true);
 
   db.prepare("UPDATE config SET value = 'second' WHERE key = 'marker'").run();
   createAtomicBackup(db, target);
@@ -91,6 +93,36 @@ test('recovery skips empty or corrupt recent backups and restores the newest val
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('backup due check trusts only validated completion markers and avoids restart rewrites', () => {
+  const dir = tempDir();
+  const now = Date.parse('2026-09-17T12:00:00Z');
+  const recent = path.join(dir, 'streamvault-2026-09-17.db');
+  fs.writeFileSync(recent, 'not a completed SQLite backup');
+  fs.utimesSync(recent, new Date(now - 60_000), new Date(now - 60_000));
+
+  assert.equal(isDatabaseBackupDue(dir, 24 * 60 * 60 * 1000, now), true);
+
+  const source = path.join(dir, 'source.db');
+  const db = createDb(source, 'completed');
+  createAtomicBackup(db, recent);
+  db.close();
+  fs.utimesSync(recent, new Date(now - 60_000), new Date(now - 60_000));
+  fs.utimesSync(`${recent}.complete`, new Date(now - 60_000), new Date(now - 60_000));
+
+  assert.equal(isDatabaseBackupDue(dir, 24 * 60 * 60 * 1000, now), false);
+  assert.equal(isDatabaseBackupDue(dir, 30_000, now), true);
+  assert.equal(isDatabaseBackupDue(path.join(dir, 'missing'), 1, now), true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('backup due check treats an unreadable backup path as due instead of crashing', () => {
+  const dir = tempDir();
+  const notDirectory = path.join(dir, 'not-a-directory');
+  fs.writeFileSync(notDirectory, 'file');
+  assert.equal(isDatabaseBackupDue(notDirectory, 1), true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('validation rejects an empty SQLite file with no StreamVault schema', () => {
   const dir = tempDir();
   const empty = path.join(dir, 'empty.db');
@@ -130,11 +162,14 @@ test('backup retention removes invalid snapshots and keeps seven valid snapshots
   const dir = tempDir();
   for (let day = 1; day <= 8; day++) {
     const date = `2026-01-${String(day).padStart(2, '0')}`;
-    createDb(path.join(dir, `streamvault-${date}.db`), date).close();
+    const snapshot = path.join(dir, `streamvault-${date}.db`);
+    createDb(snapshot, date).close();
+    fs.writeFileSync(`${snapshot}.complete`, 'validated\n');
   }
   const invalid = path.join(dir, 'streamvault-2026-01-09.db');
   const abandonedTemp = path.join(dir, 'streamvault-2026-01-10.db.tmp-123-456');
   fs.writeFileSync(invalid, 'not sqlite');
+  fs.writeFileSync(`${invalid}.complete`, 'validated\n');
   fs.writeFileSync(abandonedTemp, 'partial snapshot');
 
   const warnings = pruneDatabaseBackups(dir);
@@ -143,8 +178,11 @@ test('backup retention removes invalid snapshots and keeps seven valid snapshots
   assert.equal(fs.existsSync(invalid), false);
   assert.equal(fs.existsSync(abandonedTemp), false);
   const retained = fs.readdirSync(dir).filter(name => /^streamvault-.*\.db$/.test(name));
+  const retainedMarkers = fs.readdirSync(dir).filter(name => /^streamvault-.*\.db\.complete$/.test(name));
   assert.equal(retained.length, 7);
+  assert.equal(retainedMarkers.length, 7);
   assert.equal(retained.includes('streamvault-2026-01-01.db'), false);
+  assert.equal(fs.existsSync(`${invalid}.complete`), false);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

@@ -3,8 +3,8 @@ import { IOS_HLS_IDLE_TIMEOUT_MS, findReusableIosHlsSession, iosHlsProcessExitSt
 
 describe('iOS HLS session lifetime', () => {
   it('keeps prefetched movie segments available across Safari buffer gaps', () => {
-    const observedSafariBufferGapMs = 4 * 60_000;
-    expect(IOS_HLS_IDLE_TIMEOUT_MS).toBeGreaterThan(observedSafariBufferGapMs);
+    const maximumExpectedPrefetchGapMs = 20 * 60_000;
+    expect(IOS_HLS_IDLE_TIMEOUT_MS).toBeGreaterThan(maximumExpectedPrefetchGapMs);
   });
 });
 

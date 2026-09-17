@@ -25,7 +25,7 @@ import {
   getChannelsByContentTypeCursor, getChannelsByGroupCursor,
   insertRecording, updateRecording, deleteRecording, getRecording, getRecordings,
   insertRecordingRule, updateRecordingRule, deleteRecordingRule, getRecordingRules, getRecordingRule,
-  closeDatabase, backupDatabase, getDatabaseHealth,
+  closeDatabase, backupDatabaseIfDue, getDatabaseHealth,
 } from './db.js';
 import type { DBRecording } from './db.js';
 import { getStatus, sync, cancelSync, startupSync, startCrawl, cancelCrawl } from './sync.js';
@@ -40,7 +40,7 @@ import { recoverRecordings } from './recorder.js';
 import { rewriteHlsManifest } from './hls.js';
 import { buildFragmentedMp4Args } from './vod-remux.js';
 import { buildBrowserCompatibleVideoArgs } from './browser-transcode.js';
-import { buildIosHlsArgs, iosHlsContentType } from './ios-hls.js';
+import { buildIosHlsArgs, buildIosHlsRecoveryUrl, iosHlsContentType, iosHlsModesNeedRetry, probeIosHlsMediaModes } from './ios-hls.js';
 import { IOS_HLS_IDLE_TIMEOUT_MS, findReusableIosHlsSession, iosHlsProcessExitState, iosHlsSessionKey, iosHlsSessionLimitReason, selectIosHlsSessionsToRetire } from './ios-hls-sessions.js';
 import { createIosHlsAuthorizationLimiter, createIosHlsTicket, sanitizeFfmpegMessage, verifyIosHlsTicket } from './ios-hls-security.js';
 import { selectIosVodFallback } from './ios-vod.js';
@@ -78,6 +78,7 @@ const IOS_HLS_MAX_STORAGE_BYTES = 4 * 1024 * 1024 * 1024;
 const IOS_HLS_TICKET_TTL_MS = 30_000;
 const MAX_IOS_HLS_SESSIONS = 2;
 const liveAudioTranscodes = new ConcurrentStreamLimiter(2);
+const iosHlsProbes = new ConcurrentStreamLimiter(MAX_IOS_HLS_SESSIONS);
 const iosHlsTicketSecret = randomBytes(32).toString('hex');
 const iosHlsTicketNonces = new Map<string, number>();
 const iosHlsAuthorizationLimiter = createIosHlsAuthorizationLimiter();
@@ -1093,7 +1094,7 @@ app.get('/api/ios-hls-authorize/:channelId/index.m3u8', (req, res) => {
   res.set('Cache-Control', 'no-store').redirect(302, `/api/ios-hls/${encodeURIComponent(channelId)}/index.m3u8?${params.toString()}`);
 });
 
-app.get('/api/ios-hls/:channelId/index.m3u8', (req, res) => {
+app.get('/api/ios-hls/:channelId/index.m3u8', async (req, res) => {
   const channelId = req.params.channelId;
   const contentType = iosHlsContentType(channelId, req.query.type);
   if (!contentType || typeof req.query.url !== 'string') {
@@ -1133,7 +1134,12 @@ app.get('/api/ios-hls/:channelId/index.m3u8', (req, res) => {
   if (existingSessionId) {
     const existing = iosHlsSessions.get(existingSessionId);
     if (!existing || existing.channelId !== channelId) {
-      res.status(404).json({ error: 'iPhone stream session expired' });
+      res.set('Cache-Control', 'no-store').redirect(302, buildIosHlsRecoveryUrl(
+        channelId,
+        requestValidation.url.toString(),
+        contentType,
+        startSeconds || 0,
+      ));
       return;
     }
     existing.expiresAt = Date.now() + IOS_HLS_IDLE_TIMEOUT_MS;
@@ -1185,16 +1191,56 @@ app.get('/api/ios-hls/:channelId/index.m3u8', (req, res) => {
     return;
   }
 
+  const sourcePath = `/api/stream/${encodeURIComponent(sourceChannelId)}?url=${encodeURIComponent(sourceValidation.url.toString())}&type=${contentType}`;
+  const sourceUrl = `http://127.0.0.1:${PORT}${sourcePath}`;
+  const releaseProbe = iosHlsProbes.acquire();
+  if (!releaseProbe) {
+    res.set('Retry-After', '2').status(503).json({ error: 'iPhone stream preparation capacity reached' });
+    return;
+  }
+
+  let mediaModes: Awaited<ReturnType<typeof probeIosHlsMediaModes>>;
+  try {
+    mediaModes = await probeIosHlsMediaModes(sourceUrl);
+    if (iosHlsModesNeedRetry(mediaModes)) {
+      mediaModes = await probeIosHlsMediaModes(sourceUrl);
+    }
+  } finally {
+    releaseProbe();
+  }
+  if (req.aborted || res.destroyed) return;
+
+  // Another authorized request may have completed while this one was probing.
+  // Reuse it instead of launching duplicate FFmpeg work.
+  const sessionStartedDuringProbe = findReusableIosHlsSession(iosHlsSessions, sessionKey);
+  if (sessionStartedDuringProbe) {
+    const reusable = iosHlsSessions.get(sessionStartedDuringProbe)!;
+    reusable.expiresAt = Date.now() + IOS_HLS_IDLE_TIMEOUT_MS;
+    const params = new URLSearchParams({
+      url: requestValidation.url.toString(),
+      type: contentType,
+      session: sessionStartedDuringProbe,
+    });
+    if (requestedStart) params.set('start', String(requestedStart));
+    res.redirect(302, `/api/ios-hls/${encodeURIComponent(channelId)}/index.m3u8?${params.toString()}`);
+    return;
+  }
+
   const sessionId = randomUUID();
   const directory = path.join(IOS_HLS_ROOT, sessionId);
   const playlistPath = path.join(directory, 'index.m3u8');
+  // Re-evaluate the cap after the asynchronous probe so concurrent starts
+  // cannot create more than the configured number of FFmpeg sessions.
   for (const staleSessionId of selectIosHlsSessionsToRetire(iosHlsSessions, channelId, MAX_IOS_HLS_SESSIONS)) {
     retireIosHlsSession(staleSessionId, 'superseded');
   }
   fs.mkdirSync(directory, { recursive: true });
-  const sourcePath = `/api/stream/${encodeURIComponent(sourceChannelId)}?url=${encodeURIComponent(sourceValidation.url.toString())}&type=${contentType}`;
-  const sourceUrl = `http://127.0.0.1:${PORT}${sourcePath}`;
-  const ff = spawn('ffmpeg', buildIosHlsArgs(sourceUrl, playlistPath, startSeconds || 0), { stdio: ['ignore', 'ignore', 'pipe'] });
+  logger.info(`iOS HLS[${channelId}]: video mode=${mediaModes.video}, audio mode=${mediaModes.audio}`);
+  const ff = spawn(
+    'ffmpeg',
+    buildIosHlsArgs(sourceUrl, playlistPath, requestedStart, mediaModes.video, mediaModes.audio),
+    { stdio: ['ignore', 'ignore', 'pipe'] },
+  );
   iosHlsSessions.set(sessionId, {
     directory,
     process: ff,
@@ -1893,6 +1939,10 @@ app.get('/{*path}', (req, res) => {
 
 // ---------- Start ----------
 
+const BACKUP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const BACKUP_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const STARTUP_BACKUP_DELAY_MS = 10 * 60 * 1000;
+
 const httpServer = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`StreamVault server listening on http://0.0.0.0:${PORT}`);
   startupSync();
@@ -1906,12 +1956,15 @@ const httpServer = app.listen(PORT, '0.0.0.0', () => {
     logger.error(`Failed to recover recordings: ${err}`);
     startScheduler();
   });
-  // Initial backup on boot, then daily.
-  backupDatabase();
+  // A restart must not immediately rewrite the entire database. After startup
+  // settles, back up only if no recent validated snapshot exists.
+  const startupBackupTimer = setTimeout(() => {
+    void backupDatabaseIfDue(BACKUP_MAX_AGE_MS);
+  }, STARTUP_BACKUP_DELAY_MS);
+  startupBackupTimer.unref();
 });
 
-const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const backupTimer = setInterval(() => { backupDatabase(); }, BACKUP_INTERVAL_MS);
+const backupTimer = setInterval(() => { void backupDatabaseIfDue(BACKUP_MAX_AGE_MS); }, BACKUP_CHECK_INTERVAL_MS);
 if (typeof backupTimer.unref === 'function') backupTimer.unref();
 
 // ---------- Graceful shutdown ----------

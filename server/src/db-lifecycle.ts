@@ -56,13 +56,18 @@ export function validateDatabaseFile(file: string): DatabaseValidation {
 export function createAtomicBackup(db: InstanceType<typeof Database>, target: string): void {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const temp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  const marker = `${target}.complete`;
+  const markerTemp = `${marker}.tmp-${process.pid}-${Date.now()}`;
   try {
     db.exec(`VACUUM INTO ${quoteSqlString(temp)}`);
     const validation = validateDatabaseFile(temp);
     if (!validation.ok) throw new Error(`Backup validation failed: ${validation.error}`);
     fs.renameSync(temp, target);
+    fs.writeFileSync(markerTemp, 'validated\n', { mode: 0o600 });
+    fs.renameSync(markerTemp, marker);
   } catch (error) {
     try { fs.unlinkSync(temp); } catch { /* temp may not have been created */ }
+    try { fs.unlinkSync(markerTemp); } catch { /* marker may already be published */ }
     throw error;
   }
 }
@@ -78,6 +83,30 @@ export function findLatestValidBackup(backupDir: string): string | null {
     if (validateDatabaseFile(candidate).ok) return candidate;
   }
   return null;
+}
+
+/** Cheap due check: only atomic markers published after full validation count. */
+export function isDatabaseBackupDue(backupDir: string, maxAgeMs: number, now = Date.now()): boolean {
+  if (!fs.existsSync(backupDir)) return true;
+  let names: string[];
+  try {
+    names = fs.readdirSync(backupDir);
+  } catch {
+    return true;
+  }
+
+  let newestMtime = 0;
+  for (const name of names) {
+    if (!/^streamvault-\d{4}-\d{2}-\d{2}\.db\.complete$/.test(name)) continue;
+    try {
+      const marker = fs.statSync(path.join(backupDir, name));
+      const snapshot = fs.statSync(path.join(backupDir, name.slice(0, -'.complete'.length)));
+      if (marker.isFile() && snapshot.isFile() && snapshot.size > 0) {
+        newestMtime = Math.max(newestMtime, marker.mtimeMs);
+      }
+    } catch { /* missing/incomplete backup artifacts do not count */ }
+  }
+  return newestMtime === 0 || now - newestMtime >= maxAgeMs;
 }
 
 export function restoreLatestValidBackup(destination: string, backupDir: string): string | null {
@@ -120,6 +149,14 @@ function removeBackupFile(file: string, warnings: string[]): void {
     fs.unlinkSync(file);
   } catch (error) {
     warnings.push(`Failed to remove backup ${path.basename(file)}: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  try {
+    fs.unlinkSync(`${file}.complete`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      warnings.push(`Failed to remove backup marker ${path.basename(file)}.complete: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
 

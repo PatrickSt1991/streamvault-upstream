@@ -4,10 +4,10 @@ export interface IosHlsSessionDescriptor {
   expiresAt: number;
 }
 
-// Native Safari can prefetch several minutes of HLS segments, leaving no
-// requests while it drains that buffer. Keep the backing files longer than
-// that quiet window; global session, lifetime, and storage caps still apply.
-export const IOS_HLS_IDLE_TIMEOUT_MS = 10 * 60_000;
+// Native Safari can prefetch well ahead of playback, leaving no asset requests
+// while it drains that buffer. Keep paced rolling sessions through that quiet
+// window; global session, lifetime, and storage caps still apply.
+export const IOS_HLS_IDLE_TIMEOUT_MS = 30 * 60_000;
 
 export interface ReusableIosHlsSession {
   key: string;
