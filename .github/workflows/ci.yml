@@ -23,6 +23,11 @@ jobs:
             package-lock.json
             server/package-lock.json
 
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Install frontend dependencies
         run: npm ci
 
