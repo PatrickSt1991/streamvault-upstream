@@ -1,12 +1,14 @@
 import { defineConfig, type Plugin } from 'vite'
 import { execSync } from 'child_process'
+import { readFileSync } from 'fs'
+import { fileURLToPath } from 'url'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import legacy from '@vitejs/plugin-legacy'
 import { VitePWA } from 'vite-plugin-pwa'
 import postcss from 'postcss'
 import postcssPresetEnv from 'postcss-preset-env'
-import type { Plugin as PostcssPlugin, Rule as PostcssRule } from 'postcss'
+import type { Plugin as PostcssPlugin, Declaration as PostcssDeclaration } from 'postcss'
 import { CACHEABLE_API_PATTERN } from './src/utils/pwa-cache.ts'
 
 // When VITE_SERVER_URL is explicitly set (e.g. "" for Docker/PWA), use it.
@@ -22,7 +24,7 @@ const serverUrl = process.env.VITE_SERVER_URL !== undefined
  * other features that Chromium <99 silently drops, leaving the TV with no
  * styles. The default build targets Chrome 76 to cover Tizen 6.0 (2021 sets)
  * and up; the `tizen5` mode targets Chrome 63 (Tizen 5.0/5.5, 2019–2020 sets)
- * and adds two fixups preset-env has no feature for (see below).
+ * and adds the fixups preset-env has no feature for (the tizen* plugins below).
  *
  * Runs at `generateBundle` (post-build) on the final CSS asset so it catches
  * everything Tailwind, Vite, and any plugin emit — regardless of where each
@@ -30,6 +32,8 @@ const serverUrl = process.env.VITE_SERVER_URL !== undefined
  */
 function lowerModernCss(opts: { browsers: string; legacy: boolean }): Plugin {
   const processor = postcss([
+    // Before preset-env, so its `:is()` lowering also covers `:where()`.
+    ...(opts.legacy ? [tizenWhereToIs()] : []),
     postcssPresetEnv({
       // stage 2 = features approaching standard; conservative default.
       stage: 2,
@@ -46,7 +50,16 @@ function lowerModernCss(opts: { browsers: string; legacy: boolean }): Plugin {
         'color-functional-notation': true,
       },
     }),
-    ...(opts.legacy ? [tizenFlexGapFallback(), tizenInsetLonghand()] : []),
+    ...(opts.legacy
+      ? [
+          tizenPropertyInitialValues(),
+          tizenGapAlias(),
+          tizenTransformLonghand(),
+          tizenInsetLonghand(),
+          tizenViewportUnits(),
+          tizenGradientInterpolation(),
+        ]
+      : []),
   ]);
 
   return {
@@ -67,70 +80,200 @@ function lowerModernCss(opts: { browsers: string; legacy: boolean }): Plugin {
 }
 
 /**
- * Chromium 63 predates `gap` in FLEXBOX (Chrome 84) — it is silently ignored
- * and every flex layout collapses together. Grid `gap` shorthands only work
- * from Chrome 66; Chrome 47–65 need the `grid-*` names (still honored by
- * modern browsers). This plugin REPLACES flex gap with child-margin rules and
- * renames grid gap, which render identically from Chrome 47 to current — no
- * @supports gymnastics, no double spacing.
- *
- *   row (default):        .sel > * + * { margin-left: <gap> }
- *   flex-direction:column .sel > * + * { margin-top: <gap> }
- *   flex-wrap:wrap        .sel > *     { margin: 0 <gap> <gap> 0 }
- *
- * NB: only fires on rules that declare display + gap together. Tailwind's
- * atomic utilities split these across rules, so author your own gapped flex
- * containers as combined rules (or use grid) for correct TV spacing.
+ * `:where()` is Chrome 88+. preset-env lowers `:is()` but has no feature for
+ * `:where()`, and Chromium 63 drops any rule whose selector it cannot parse —
+ * Tailwind's `group-*` variants and a good part of its preflight go with it.
+ * The only difference between the two is specificity, which matters less
+ * than the rule existing at all, so swap the name and let the `:is()`
+ * lowering take it from there.
  */
-function tizenFlexGapFallback(): PostcssPlugin {
+function tizenWhereToIs(): PostcssPlugin {
   return {
-    postcssPlugin: 'tizen-flex-gap-fallback',
+    postcssPlugin: 'tizen-where-to-is',
+    Rule(rule) {
+      if (rule.selector.includes(':where(')) rule.selector = rule.selector.replace(/:where\(/g, ':is(')
+    },
+  }
+}
+
+/**
+ * `@property` is Chrome 85+. Tailwind v4 registers every `--tw-*` variable
+ * with it and leans on the registered initial value: `.border` is
+ * `border-style: var(--tw-border-style)`, a shadow or gradient is a chain of
+ * `var()`s, a transform utility reads the axes it does not set. Its own
+ * fallback for engines without `@property` is an `@supports` block keyed on
+ * `-webkit-hyphens`, which Chromium 63 on Tizen does not match either
+ * (checked in headless Chrome 63: the block's variables come back empty). So
+ * on that engine every one of those `var()`s is undefined, the declaration is
+ * invalid at computed-value time, and borders, shadows, gradients and
+ * transforms vanish. Replay the registered initial values as one universal
+ * rule at the top of the sheet — the same shape as Tailwind's fallback, made
+ * unconditional — and drop the `@property` rules the engine would ignore.
+ */
+function tizenPropertyInitialValues(): PostcssPlugin {
+  return {
+    postcssPlugin: 'tizen-property-initial-values',
     OnceExit(root, { Rule, Declaration }) {
-      root.walkRules((rule) => {
-        if (!rule.selector || rule.selector.includes('>')) return
-        let display: string | undefined
-        let gap: string | undefined
-        let rowGap: string | undefined
-        let colGap: string | undefined
-        let column = false
-        let wrap = false
-        rule.walkDecls((d) => {
-          if (d.prop === 'display') display = d.value
-          else if (d.prop === 'gap') gap = d.value
-          else if (d.prop === 'row-gap') rowGap = d.value
-          else if (d.prop === 'column-gap') colGap = d.value
-          else if (d.prop === 'flex-direction' && d.value.includes('column')) column = true
-          else if (d.prop === 'flex-wrap' && d.value.includes('wrap')) wrap = true
+      const initial: PostcssDeclaration[] = []
+      root.walkAtRules('property', (at) => {
+        const name = at.params.trim()
+        at.walkDecls('initial-value', (d) => {
+          initial.push(new Declaration({ prop: name, value: d.value }))
         })
-        if (!gap && !rowGap && !colGap) return
-        if (display && /grid/.test(display)) {
-          // GRID: rename to the grid-* longhands Chrome 47–65 honor.
-          rule.walkDecls((d) => {
-            if (d.prop === 'gap') d.prop = 'grid-gap'
-            else if (d.prop === 'row-gap') d.prop = 'grid-row-gap'
-            else if (d.prop === 'column-gap') d.prop = 'grid-column-gap'
-          })
-          return
-        }
-        if (!display || !/flex/.test(display)) return
-        const parts = (gap || '').trim().split(/\s+/)
-        const rg = rowGap || parts[0]
-        const cg = colGap || parts[1] || parts[0]
-        rule.walkDecls((d) => {
-          if (d.prop === 'gap' || d.prop === 'row-gap' || d.prop === 'column-gap') d.remove()
-        })
-        const childRule: PostcssRule = new Rule({
-          selector: rule.selectors.map((s) => (wrap ? `${s} > *` : `${s} > * + *`)).join(',\n'),
-        })
-        if (wrap) {
-          childRule.append(new Declaration({ prop: 'margin', value: `0 ${cg} ${rg} 0` }))
-        } else {
-          childRule.append(
-            new Declaration({ prop: column ? 'margin-top' : 'margin-left', value: column ? rg : cg })
-          )
-        }
-        rule.after(childRule)
+        at.remove()
       })
+      if (initial.length === 0) return
+      const defaults = new Rule({ selector: '*, :before, :after, ::backdrop' })
+      defaults.append(...initial)
+      // After any leading @charset/@import, which must stay first.
+      const anchor = root.nodes.find(
+        (n) => !(n.type === 'atrule' && (n.name === 'charset' || n.name === 'import'))
+      )
+      if (anchor) anchor.before(defaults)
+      else root.append(defaults)
+    },
+  }
+}
+
+/**
+ * Chromium 63 predates `gap` on flex containers (Chrome 84) and knows grid gap
+ * only under its `grid-*` names (Chrome 57–65; the unprefixed shorthands are
+ * Chrome 66). Rename every gap declaration to that alias, which current
+ * engines still honor on grid and flex alike. On the old engine that gives
+ * grid containers their spacing natively — and, although it ignores the
+ * property on a flex container, it still COMPUTES it there, which is what
+ * scripts/tizen5-flex-gap.js reads back to turn into margins on the children.
+ * That runtime is what makes Tailwind's atomic utilities work: a fallback
+ * chosen per element from computed display and direction, not per rule, so
+ * the stylesheet never needs to know that `flex`, `flex-col`, `lg:flex-row`
+ * and `gap-3` meet on the same element.
+ */
+function tizenGapAlias(): PostcssPlugin {
+  return {
+    postcssPlugin: 'tizen-gap-alias',
+    Declaration(decl) {
+      if (decl.prop === 'gap') decl.prop = 'grid-gap'
+      else if (decl.prop === 'row-gap') decl.prop = 'grid-row-gap'
+      else if (decl.prop === 'column-gap') decl.prop = 'grid-column-gap'
+    },
+  }
+}
+
+/**
+ * The individual transform properties `translate`, `rotate` and `scale` are
+ * Chrome 104+. Chromium 63 drops them, so Tailwind's translate-* and scale-*
+ * utilities do nothing there: a centred overlay sits in the wrong corner and
+ * a focused tile never grows. Fold each such rule into one `transform` built
+ * from the same `--tw-*` variables Tailwind sets, in the order the individual
+ * properties apply (translate, rotate, scale), so utilities from separate
+ * rules still compose on one element. A literal value (`scale: 1.02`) is
+ * moved into the variables first. Percentages become plain numbers, because
+ * `scale(105%)` is Transforms Level 2 syntax the old engine rejects as well.
+ */
+function tizenTransformLonghand(): PostcssPlugin {
+  const composed =
+    'translate(var(--tw-translate-x, 0), var(--tw-translate-y, 0)) ' +
+    'rotate(var(--tw-rotate, 0deg)) ' +
+    'scale(var(--tw-scale-x, 1), var(--tw-scale-y, 1))'
+  const percentToNumber = (v: string) =>
+    v.replace(/(-?\d*\.?\d+)%/g, (_, n: string) => String(parseFloat(n) / 100))
+  const parts = (v: string) => v.trim().split(/\s+/)
+  return {
+    postcssPlugin: 'tizen-transform-longhand',
+    OnceExit(root, { Declaration }) {
+      root.walkRules((rule) => {
+        const individual = rule.nodes.filter(
+          (n): n is PostcssDeclaration =>
+            n.type === 'decl' && (n.prop === 'translate' || n.prop === 'scale' || n.prop === 'rotate')
+        )
+        if (individual.length === 0) return
+        const has = (prop: string) => rule.some((n) => n.type === 'decl' && n.prop === prop)
+        const define = (prop: string, value: string) => {
+          if (!has(prop)) rule.append(new Declaration({ prop, value }))
+        }
+        rule.walkDecls(/^--tw-scale-/, (d) => {
+          d.value = percentToNumber(d.value)
+        })
+        for (const d of individual) {
+          const literal = !d.value.includes('var(')
+          if (d.prop === 'translate') {
+            const [x, y = '0'] = d.value === 'none' ? ['0', '0'] : parts(d.value)
+            if (literal) {
+              define('--tw-translate-x', x)
+              define('--tw-translate-y', y)
+            }
+          } else if (d.prop === 'scale') {
+            const [x, y = x] = d.value === 'none' ? ['1', '1'] : parts(percentToNumber(d.value))
+            if (literal) {
+              define('--tw-scale-x', x)
+              define('--tw-scale-y', y)
+            }
+          } else if (literal) {
+            define('--tw-rotate', d.value === 'none' ? '0deg' : d.value)
+          }
+          d.remove()
+        }
+        rule.append(new Declaration({ prop: 'transform', value: composed }))
+      })
+    },
+  }
+}
+
+/**
+ * Chromium 63 has neither `dvh` (Chrome 108) nor `env()` (Chrome 69), and a
+ * value using either is dropped whole — `min-h-[60dvh]` becomes no
+ * min-height, and every safe-area padding disappears. A TV has no dynamic
+ * toolbar and no notch, so `dvh` is `vh` there and `env(safe-area-inset-*)`
+ * is whatever fallback the author gave it (or nothing).
+ */
+function tizenViewportUnits(): PostcssPlugin {
+  const safeArea = /env\(\s*safe-area-inset-[a-z]+\s*(?:,\s*([^()]*(?:\([^()]*\)[^()]*)*))?\)/g
+  return {
+    postcssPlugin: 'tizen-viewport-units',
+    Declaration(decl) {
+      const before = decl.value
+      if (!/dvh|env\(/.test(before)) return
+      const after = before
+        .replace(/(\d)dvh\b/g, '$1vh')
+        .replace(safeArea, (_, fallback?: string) => (fallback ?? '0px').trim())
+      if (after !== before) decl.value = after
+    },
+  }
+}
+
+/**
+ * Tailwind v4 writes its gradient direction as `to right in oklab`. The colour
+ * interpolation method is Chrome 111+ syntax, so on Chromium 63 every
+ * `linear-gradient()` built from it is invalid and each `bg-gradient-to-*`
+ * renders nothing. Drop the method (and any hue-direction after it); the
+ * gradient interpolates in sRGB, as it did before Tailwind 4.
+ */
+function tizenGradientInterpolation(): PostcssPlugin {
+  const method = /\s+in\s+[a-z][a-z0-9-]*(?:\s+(?:shorter|longer|increasing|decreasing)\s+hue)?\b/g
+  return {
+    postcssPlugin: 'tizen-gradient-interpolation',
+    Declaration(decl) {
+      if (decl.prop !== '--tw-gradient-position' && !/gradient\(/.test(decl.value)) return
+      const after = decl.value.replace(method, '')
+      if (after !== decl.value) decl.value = after
+    },
+  }
+}
+
+/**
+ * Inline scripts/tizen5-flex-gap.js into the widget's index.html, in <head>,
+ * so it is already observing when the bundle renders its first element. See
+ * tizenGapAlias() for the CSS half it depends on.
+ */
+function tizenFlexGapRuntime(): Plugin {
+  // The file's header comment stays with the file; the page gets a pointer.
+  const source = readFileSync(fileURLToPath(new URL('./scripts/tizen5-flex-gap.js', import.meta.url)), 'utf8')
+    .replace(/^\s*\/\*[\s\S]*?\*\/\s*/, '/* scripts/tizen5-flex-gap.js */\n')
+  return {
+    name: 'tizen-flex-gap-runtime',
+    enforce: 'post',
+    transformIndexHtml() {
+      return [{ tag: 'script', children: source, injectTo: 'head' }]
     },
   }
 }
@@ -223,8 +366,17 @@ export default defineConfig(({ mode }) => {
             // Tizen TVs run old Chromium WebViews (Tizen 5.x = Chrome 63,
             // 4.0 = 56, 3.0 = 47). Transpile + polyfill down to Chrome 47 so
             // the same widget has a chance on the older sets too.
-            legacy({ targets: ['chrome >= 47'] }),
+            legacy({
+              targets: ['chrome >= 47'],
+              // core-js covers the language; this covers a web API the app
+              // leans on for channel loads and subtitle streams that Chromium
+              // 63 lacks (AbortController is Chrome 66, and fetch() only
+              // honors `signal` from there too — the patch-fetch build of
+              // the polyfill wires both).
+              additionalLegacyPolyfills: ['abortcontroller-polyfill/dist/polyfill-patch-fetch'],
+            }),
             tizenLegacyOnly(),
+            tizenFlexGapRuntime(),
           ]
         : [
             VitePWA({
